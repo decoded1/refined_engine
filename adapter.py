@@ -12,10 +12,11 @@ import time
 import math
 import os
 import requests
+import socket
 from typing import Optional
 from urllib.parse import urlencode
 
-from .config import REST_BASE, IS_TESTNET, sign_hmac, API_KEY_BYTES, API_SECRET_BYTES, sign_hmac_bytes
+from .config import REST_BASE, IS_TESTNET, sign_hmac, API_KEY_BYTES, API_SECRET_BYTES, sign_hmac_bytes, logger
 from .models import (
     PlaceOrderRequest,
     AmendOrderRequest,
@@ -33,11 +34,11 @@ from .models import (
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 def _log(msg: str):
-    print(f"  [ADAPTER] {msg}")
+    logger.log("ADAPTER", msg)
 
 
 def _warn(msg: str):
-    print(f"  [ADAPTER] ⚠ {msg}")
+    logger.log("ADAPTER", f"⚠ {msg}")
 
 
 # ── Raw Order Type (Phemex-native format) ────────────────────────────────────
@@ -109,10 +110,38 @@ class PhemexAdapter:
         self._rate_limit_used = 0.0  # 0-100%
         self.session = requests.Session()
 
+        # Phase 2 Optimization: Disable Nagle's Algorithm (TCP_NODELAY)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        adapter.poolmanager.connection_pool_kw['socket_options'] = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        ]
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+
         # Cache for product precision specs (Symbol -> Product)
         self._products: dict[str, Product] = {}
         self._qty_multipliers: dict[str, float] = {}
         self._price_multipliers: dict[str, float] = {}
+
+        # Optimized Template for Request Building
+        self._base_order_payload = {
+            "timeInForce": "GoodTillCancel",
+            "reduceOnly": "false",
+        }
+
+        # Phase 1 Ground Level: Fast ID Generator
+        self._cl_id_prefix = f"c{int(time.time())}"
+        self._cl_id_counter = 0
+        self._last_now = int(time.time())
+
+        # Optimization: Pre-encoded Path Cache
+        self._path_cache = {
+            "/g-orders/create": "/g-orders/create".encode("utf-8"),
+            "/g-orders/replace": "/g-orders/replace".encode("utf-8"),
+            "/g-orders/cancel": "/g-orders/cancel".encode("utf-8"),
+            "/g-orders/all": "/g-orders/all".encode("utf-8"),
+            "/g-accounts/accountPositions": "/g-accounts/accountPositions".encode("utf-8"),
+        }
 
     def set_products(self, products: list[Product]):
         """Populate local cache of product specs for precision formatting."""
@@ -147,19 +176,26 @@ class PhemexAdapter:
     # ── IExchange: Execution ─────────────────────────────────────────────────
 
     def place_order(self, req: PlaceOrderRequest) -> OrderResult:
-        """Place a new order on Phemex."""
+        """Place a new order on Phemex (Optimized Builder)."""
         endpoint = "/g-orders/create"
 
-        payload = {
+        # Optimization: Use template copy instead of scratch build
+        self._cl_id_counter += 1
+        payload = self._base_order_payload.copy()
+        payload.update({
             "symbol": req.symbol,
-            "clOrdID": req.cl_ord_id or str(uuid.uuid4()),
+            "clOrdID": req.cl_ord_id or f"{self._cl_id_prefix}{self._cl_id_counter}",
             "side": req.side,
             "orderQtyRq": self._fmt_qty(req.symbol, req.qty),
             "ordType": req.type,
-            "timeInForce": req.time_in_force,
-            "reduceOnly": str(req.reduce_only).lower(),
             "posSide": req.pos_side,
-        }
+        })
+
+        if req.reduce_only:
+            payload["reduceOnly"] = "true"
+        
+        if req.time_in_force != "GoodTillCancel":
+            payload["timeInForce"] = req.time_in_force
 
         if req.price is not None:
             payload["priceRp"] = self._fmt_price(req.symbol, req.price)
@@ -290,13 +326,12 @@ class PhemexAdapter:
         self._request("DELETE", endpoint, payload)
 
     def cancel_orders(self, symbol: str, order_ids: list[str], pos_side: str = "Merged") -> None:
-        """Bulk cancel specific orders."""
+        """Bulk cancel specific orders using the native Phemex bulk endpoint."""
         if not order_ids:
             return
 
         endpoint = "/g-orders"
-        # Join IDs with comma. requests/urlencode will encode this as %2C
-        # but _request will handle unescaping for signature.
+        # Phemex bulk DELETE accepts comma-separated IDs in the query string
         payload = {
             "symbol": symbol,
             "orderID": ",".join(order_ids),
@@ -355,6 +390,7 @@ class PhemexAdapter:
                 margin=float(p.get("usedBalanceRv", "0")),
                 pos_side=pos_side,
                 side_multiplier=multiplier,
+                pnl_factor=size * multiplier,
             ))
 
         return AccountInfo(
@@ -496,17 +532,33 @@ class PhemexAdapter:
     def _request(self, method: str, endpoint: str, params: Optional[dict] = None) -> dict:
         """Make an authenticated request with HMAC-SHA256 signing."""
         params = params or {}
-        expiry = int(time.time()) + 60
+        
+        # Ground Level: Local attribute binding
+        base = self._base
+        last_now = self._last_now
+        secret_bytes = self._api_secret_bytes
+        path_cache = self._path_cache
+
+        # Optimization: Clock-step caching
+        now = int(time.time())
+        if now > last_now:
+            self._last_now = now
+            last_now = now
+        expiry = last_now + 60
 
         # Phemex G-API uses query string for all methods
         query_string = urlencode(params)
-        path = endpoint + (f"?{query_string}" if query_string else "")
-        full_url = f"{self._base}{path}"
+        path = "".join([endpoint, "?", query_string]) if query_string else endpoint
+        full_url = "".join([base, path])
 
         # Signature: HMAC(endpoint + queryString + expiry)
         query_string_sig = query_string.replace("%2C", ",")
-        sign_string = f"{endpoint}{query_string_sig}{expiry}"
-        signature = sign_hmac_bytes(self._api_secret_bytes, sign_string.encode("utf-8"))
+        
+        # Optimization: Use pre-encoded path if available
+        end_bytes = path_cache.get(endpoint) or endpoint.encode("utf-8")
+        sign_string_bytes = "".join([query_string_sig, str(expiry)]).encode("utf-8")
+        
+        signature = sign_hmac_bytes(secret_bytes, b"".join([end_bytes, sign_string_bytes]))
 
         headers = {
             "x-phemex-access-token": self._api_key,

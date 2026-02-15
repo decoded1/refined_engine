@@ -13,24 +13,26 @@ All public endpoints — no authentication required.
 from __future__ import annotations
 import time
 import requests
+import socket
+import operator
 from typing import Optional
 
-from .config import REST_BASE
+from .config import REST_BASE, logger
 from .models import Product, Candle, TickerData, OrderbookSnapshot, OrderbookLevel
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 def _log(msg: str):
-    print(f"  [REST] {msg}")
+    logger.log("REST", msg)
 
 
 def _warn(msg: str):
-    print(f"  [REST] ⚠ {msg}")
+    logger.log("REST", f"⚠ {msg}")
 
 
 def _err(msg: str):
-    print(f"  [REST] ❌ {msg}")
+    logger.log("REST", f"❌ {msg}")
 
 
 # ── The Client ───────────────────────────────────────────────────────────────
@@ -41,6 +43,16 @@ class RestClient:
     def __init__(self, base_url: Optional[str] = None):
         self.base = base_url or REST_BASE
         self.session = requests.Session()
+        
+        # Phase 2 Optimization: Disable Nagle's Algorithm (TCP_NODELAY)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        # Deep hook into urllib3 to set socket options
+        adapter.poolmanager.connection_pool_kw['socket_options'] = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        ]
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+        
         self._in_flight: set[str] = set()
 
     # ── Products ─────────────────────────────────────────────────────────────
@@ -282,23 +294,35 @@ class RestClient:
             ask=val("askRp", "ask"),
         )
 
-    def _parse_rows(self, rows: list) -> list[Candle]:
-        """Parse kline row arrays into Candle objects."""
-        candles = []
-        for row in rows:
-            t = int(row[0])
-            if t > 2_000_000_000:
-                t = t // 1000  # ms → s
+    # Optimized item extractor for candle rows
+    _candle_getter = operator.itemgetter(0, 3, 4, 5, 6, 7)
 
-            candles.append(Candle(
-                time=t,
-                open=float(row[3]),
-                high=float(row[4]),
-                low=float(row[5]),
-                close=float(row[6]),
-                volume=float(row[7]) if len(row) > 7 else 0.0,
-            ))
-        return candles
+    def _parse_rows(self, rows: list) -> list[Candle]:
+        """Parse kline row arrays into Candle objects (Optimized Batch Parsing)."""
+        if not rows: return []
+        
+        get = self._candle_getter
+        
+        # Optimization: Detect scale factor once per batch
+        first_ts = int(rows[0][0])
+        is_ms = first_ts > 2_000_000_000
+        
+        if is_ms:
+            return [
+                Candle(
+                    int(data[0]) // 1000,
+                    float(data[1]), float(data[2]), float(data[3]), float(data[4]), 
+                    float(data[5])
+                ) for data in (get(r) for r in rows)
+            ]
+        else:
+            return [
+                Candle(
+                    int(data[0]),
+                    float(data[1]), float(data[2]), float(data[3]), float(data[4]), 
+                    float(data[5])
+                ) for data in (get(r) for r in rows)
+            ]
 
     @staticmethod
     def format_resolution(seconds: int) -> str:

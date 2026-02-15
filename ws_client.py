@@ -4,10 +4,11 @@ Thread-safe: runs the WS event loop in a background thread.
 """
 
 from __future__ import annotations
-import json
+import orjson as json
 import time
 import threading
 import queue
+import socket
 from typing import Optional, Callable
 
 try:
@@ -16,15 +17,15 @@ try:
 except ImportError:
     HAS_WS = False
 
-from .config import WS_URL, sign_hmac
+from .config import WS_URL, sign_hmac, logger
 from .models import Candle, TickerData, Wallet, Position
 
 
 def _log(msg: str):
-    print(f"  [WS] {msg}")
+    logger.log("WS", msg)
 
 def _warn(msg: str):
-    print(f"  [WS] ⚠ {msg}")
+    logger.log("WS", f"⚠ {msg}")
 
 
 class WSClient:
@@ -46,6 +47,7 @@ class WSClient:
         self._current_resolution = 60
         self._ticker_fields: list[str] = []
         self._ticker_index_map: dict[str, int] = {}
+        self._ticker_cache: dict[str, float] = {} # {raw_str: float_val}
 
         # Async Dispatch Queue
         self._queue: queue.Queue = queue.Queue()
@@ -63,19 +65,19 @@ class WSClient:
         self.on_trade: Optional[Callable[[list[dict]], None]] = None
         self.on_orderbook: Optional[Callable[[dict], None]] = None
 
-        # Dispatch Table for O(1) message routing
-        self._dispatch_keys = {
-            "kline_p": self._handle_kline,
-            "kline": self._handle_kline,
-            "tick_p": self._handle_tick,
-            "trades_p": self._handle_trades,
-            "orderbook_p": self._handle_orderbook,
-            "accounts_p": self._handle_aop,
-            "positions_p": self._handle_aop,
-        }
-        self._dispatch_methods = {
-            "perp_market24h_pack_p.update": self._handle_ticker,
-        }
+        # Dispatch Table for O(1) message routing (Static Tuples for speed)
+        self._dispatch_keys = (
+            ("kline_p", self._handle_kline),
+            ("kline", self._handle_kline),
+            ("tick_p", self._handle_tick),
+            ("trades_p", self._handle_trades),
+            ("orderbook_p", self._handle_orderbook),
+            ("accounts_p", self._handle_aop),
+            ("positions_p", self._handle_aop),
+        )
+        self._dispatch_methods = (
+            ("perp_market24h_pack_p.update", self._handle_ticker),
+        )
 
     @property
     def connected(self) -> bool:
@@ -99,7 +101,14 @@ class WSClient:
         )
         self._thread = threading.Thread(
             target=self._ws.run_forever, 
-            kwargs={"ping_interval": 30, "ping_timeout": 10}, 
+            kwargs={
+                "ping_interval": 30, 
+                "ping_timeout": 10,
+                "sockopt": (
+                    (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                    (socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024 * 4), # 4MB Giant Buffer
+                )
+            }, 
             daemon=True
         )
         self._thread.start()
@@ -154,8 +163,17 @@ class WSClient:
         self._subscribe_market(self._current_symbol, self._current_resolution)
 
     def _on_message(self, ws, data: str):
-        """Put raw data into the queue for async processing."""
-        if not self._explicitly_closed:
+        """Put raw data into the queue for async processing with high-speed pre-scan."""
+        if self._explicitly_closed:
+            return
+
+        # Optimization: Pre-scan for symbol or control keys (id, method, result, error)
+        # This discards noise from other symbols in nanoseconds without parsing JSON.
+        if (self._current_symbol in data or 
+            "method" in data or 
+            "id" in data or 
+            "result" in data or
+            "error" in data):
             self._queue.put(data)
 
     def _process_queue(self):
@@ -167,7 +185,7 @@ class WSClient:
 
             try:
                 msg = json.loads(data)
-            except json.JSONDecodeError:
+            except Exception: # orjson has internal error types
                 self._queue.task_done()
                 continue
 
@@ -178,17 +196,23 @@ class WSClient:
 
             # 1. Dispatch by Method
             method = msg.get("method")
-            if method in self._dispatch_methods:
-                try:
-                    self._dispatch_methods[method](msg)
-                except Exception as e:
-                    _warn(f"Handler error (method={method}): {e}")
-                self._queue.task_done()
-                continue
+            if method:
+                for target_method, handler in self._dispatch_methods:
+                    if method == target_method:
+                        try:
+                            handler(msg)
+                        except Exception as e:
+                            _warn(f"Handler error (method={method}): {e}")
+                        self._queue.task_done()
+                        break
+                else: # Only if not found in methods
+                    pass
+            
+            if self._queue.unfinished_tasks == 0: continue # Method handled it
 
             # 2. Dispatch by Data Key
             handled = False
-            for key, handler in self._dispatch_keys.items():
+            for key, handler in self._dispatch_keys:
                 if key in msg:
                     try:
                         handler(msg if key in ("trades_p", "orderbook_p", "accounts_p", "positions_p") else msg[key])
@@ -204,7 +228,9 @@ class WSClient:
             self._queue.task_done()
 
     def _on_error(self, ws, error):
-        _warn(f"Error: {error}")
+        # Suppress noisy protocol errors during intentional shutdown
+        if not self._explicitly_closed:
+            _warn(f"Error: {error}")
 
     def _on_close(self, ws, code, msg):
         _log(f"Closed (code={code})")
@@ -243,9 +269,24 @@ class WSClient:
         if not row:
             return
 
+        # Optimization: Local binding and Lazy Float parsing
+        idx_map = self._ticker_index_map
+        cache = self._ticker_cache
+
         def gv(k):
-            idx = self._ticker_index_map.get(k, -1)
-            return float(row[idx]) if idx != -1 and row[idx] else 0.0
+            idx = idx_map.get(k, -1)
+            if idx == -1: return 0.0
+            val_str = row[idx]
+            if not val_str: return 0.0
+            
+            # Lazy check: If string matches last seen, return cached float
+            if val_str in cache:
+                return cache[val_str]
+            
+            # Parse once and cache
+            f_val = float(val_str)
+            cache[val_str] = f_val
+            return f_val
         ticker = TickerData(
             symbol=self._current_symbol,
             last_price=gv("lastRp"), mark_price=gv("markRp"),

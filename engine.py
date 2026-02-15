@@ -15,10 +15,13 @@ Usage:
 
 from __future__ import annotations
 import time
+import gc
+import os
+import array
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import API_KEY, API_SECRET, IS_TESTNET, NETWORK
+from .config import API_KEY, API_SECRET, IS_TESTNET, NETWORK, logger
 from .models import (
     Candle, TickerData, Product, Wallet, Position, Order,
     OrderResult, OrderbookSnapshot, PlaceOrderRequest,
@@ -30,10 +33,10 @@ from .adapter import PhemexAdapter
 
 
 def _log(msg: str):
-    print(f"[Engine] {msg}")
+    logger.log("Engine", msg)
 
 def _warn(msg: str):
-    print(f"[Engine] ⚠ {msg}")
+    logger.log("Engine", f"⚠ {msg}")
 
 
 class PhemexEngine:
@@ -58,12 +61,25 @@ class PhemexEngine:
         # State
         self._price: float = 0.0
         self._candle_map: dict[int, Candle] = {} # Internal O(1) storage
+        self._candles_cached: list[Candle] = []  # Cached sorted list
+        self._candles_dirty: bool = True         # Cache invalidation flag
+        
+        # Parallel Primitive Arrays (Phase 1.5 Optimization)
+        self._history_time = array.array('q')   # signed long long
+        self._history_open = array.array('d')   # double
+        self._history_high = array.array('d')
+        self._history_low = array.array('d')
+        self._history_close = array.array('d')
+        self._history_volume = array.array('d')
+
         self._ticker: Optional[TickerData] = None
         self._products: list[Product] = []
         self._wallet = Wallet()
         self._positions: list[Position] = []
         self._pos_map: dict[str, list[Position]] = {} # Optimized lookup
         self._orders: list[Order] = []
+        self._order_map: dict[str, Order] = {} # Optimized lookup
+        self._active_ids: set[str] = set()     # High-speed existence set
         self._orderbook = OrderbookSnapshot(symbol=symbol)
 
         # Components
@@ -98,6 +114,16 @@ class PhemexEngine:
             return
         _log(f"Booting ({NETWORK})...")
 
+        # Phase X: M3 Performance Core Priority
+        try:
+            os.nice(-20)
+            _log("🚀 Process set to HIGH PRIORITY (Performance Cores)")
+        except Exception:
+            _log("ℹ Process priority already optimized or permission restricted")
+
+        # Phase 2 Optimization: Disable automatic GC Jitter
+        gc.disable()
+
         now = int(time.time())
         self.ws.set_credentials(self._api_key, self._api_secret)
 
@@ -127,6 +153,7 @@ class PhemexEngine:
             candles = f_candles.result()
             if candles:
                 self._candle_map = {c.time: c for c in candles}
+                self._candles_dirty = True
                 if self._price == 0 and candles:
                     # Sort to find latest close for initial price
                     latest = sorted(candles, key=lambda c: c.time)[-1]
@@ -146,6 +173,7 @@ class PhemexEngine:
                     leverage=p.leverage, unrealized_pnl=p.unrealized_pnl,
                     margin=p.margin, pos_side=p.pos_side,
                     side_multiplier=p.side_multiplier,
+                    pnl_factor=p.pnl_factor,
                 ) for p in info.positions
             ]
             
@@ -158,15 +186,21 @@ class PhemexEngine:
 
             # Hydrate Orders
             raw_orders = f_orders.result()
-            self._orders = [
-                Order(
-                    order_id=o.order_id, symbol=o.symbol,
+            self._orders = []
+            self._order_map = {}
+            for o in raw_orders:
+                order_id = o.order_id
+                order = Order(
+                    order_id=order_id, symbol=o.symbol,
                     side=o.side, type=o.order_type,
                     qty=float(o.qty), price=float(o.price),
                     status="New" if o.status == "Created" else o.status,
                     trigger_price=float(o.stop_price),
-                ) for o in raw_orders
-            ]
+                )
+                self._orders.append(order)
+                self._order_map[order_id] = order
+            
+            self._active_ids = set(self._order_map.keys())
 
         self._booted = True
         _log(f"✅ Boot complete. Account: ${self._wallet.balance:,.2f} | "
@@ -176,7 +210,9 @@ class PhemexEngine:
         """Clean shutdown."""
         self.ws.disconnect()
         self._booted = False
+        gc.enable() # Re-enable system GC
         _log("Shutdown complete.")
+        # logger.shutdown() # Optional: keep alive if other engines exist
 
     def switch_symbol(self, symbol: str):
         """Switch active trading symbol."""
@@ -205,8 +241,41 @@ class PhemexEngine:
 
     @property
     def candles(self) -> list[Candle]:
-        """Returns sorted list of candles (Public API)."""
-        return sorted(self._candle_map.values(), key=lambda x: x.time)
+        """Returns sorted list of candles (Optimized Cache)."""
+        if self._candles_dirty:
+            self._candles_cached = sorted(self._candle_map.values(), key=lambda x: x.time)
+            
+            # Sync Primitive Arrays
+            self._history_time = array.array('q', [c.time for c in self._candles_cached])
+            self._history_open = array.array('d', [c.open for c in self._candles_cached])
+            self._history_high = array.array('d', [c.high for c in self._candles_cached])
+            self._history_low = array.array('d', [c.low for c in self._candles_cached])
+            self._history_close = array.array('d', [c.close for c in self._candles_cached])
+            self._history_volume = array.array('d', [c.volume for c in self._candles_cached])
+            
+            self._candles_dirty = False
+        return self._candles_cached
+
+    @property
+    def closes(self) -> array.array:
+        """Returns raw C-doubles of close prices (Vectorized)."""
+        self.candles # Trigger sync if dirty
+        return self._history_close
+
+    @property
+    def highs(self) -> array.array:
+        self.candles
+        return self._history_high
+
+    @property
+    def lows(self) -> array.array:
+        self.candles
+        return self._history_low
+
+    @property
+    def volumes(self) -> array.array:
+        self.candles
+        return self._history_volume
 
     @property
     def ticker(self) -> Optional[TickerData]:
@@ -243,14 +312,34 @@ class PhemexEngine:
     def market_buy(self, qty: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Buy", "Market", qty, pos_side=pos_side)
 
+    def market_buy_batch(self, qtys: list[float], pos_side: str = "Merged") -> list[OrderResult]:
+        """Place multiple market buy orders in parallel."""
+        reqs = [PlaceOrderRequest(self._symbol, "Buy", "Market", q, pos_side=pos_side) for q in qtys]
+        return self._pipeline_requests(self.adapter.place_order, reqs)
+
     def market_sell(self, qty: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Sell", "Market", qty, pos_side=pos_side)
+
+    def market_sell_batch(self, qtys: list[float], pos_side: str = "Merged") -> list[OrderResult]:
+        """Place multiple market sell orders in parallel."""
+        reqs = [PlaceOrderRequest(self._symbol, "Sell", "Market", q, pos_side=pos_side) for q in qtys]
+        return self._pipeline_requests(self.adapter.place_order, reqs)
 
     def limit_buy(self, qty: float, price: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Buy", "Limit", qty, price, pos_side=pos_side)
 
+    def limit_buy_batch(self, orders: list[tuple[float, float]], pos_side: str = "Merged") -> list[OrderResult]:
+        """Place multiple limit buy orders (qty, price) in parallel."""
+        reqs = [PlaceOrderRequest(self._symbol, "Buy", "Limit", q, p, pos_side=pos_side) for q, p in orders]
+        return self._pipeline_requests(self.adapter.place_order, reqs)
+
     def limit_sell(self, qty: float, price: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Sell", "Limit", qty, price, pos_side=pos_side)
+
+    def limit_sell_batch(self, orders: list[tuple[float, float]], pos_side: str = "Merged") -> list[OrderResult]:
+        """Place multiple limit sell orders (qty, price) in parallel."""
+        reqs = [PlaceOrderRequest(self._symbol, "Sell", "Limit", q, p, pos_side=pos_side) for q, p in orders]
+        return self._pipeline_requests(self.adapter.place_order, reqs)
 
     def cancel_order(self, order_id: str, pos_side: str = "Merged") -> None:
         self.adapter.cancel_order(CancelOrderRequest(
@@ -288,6 +377,22 @@ class PhemexEngine:
             symbol=self._symbol, order_id=order_id,
             price=new_price, qty=new_qty, pos_side=pos_side,
         ))
+
+    def amend_orders_batch(self, updates: list[dict]) -> list[OrderResult]:
+        """
+        Amend multiple orders in parallel.
+        Expects list of dicts: {'order_id': str, 'price': float, 'qty': float, 'pos_side': str}
+        """
+        reqs = [
+            AmendOrderRequest(
+                symbol=self._symbol, 
+                order_id=u.get("order_id"), 
+                price=u.get("price"), 
+                qty=u.get("qty"), 
+                pos_side=u.get("pos_side", "Merged")
+            ) for u in updates
+        ]
+        return self._pipeline_requests(self.adapter.amend_order, reqs)
 
     def set_leverage(self, leverage: int) -> None:
         self.adapter.set_leverage(self._symbol, leverage)
@@ -359,6 +464,7 @@ class PhemexEngine:
                     margin=p.margin,
                     pos_side=p.pos_side,
                     side_multiplier=p.side_multiplier,
+                    pnl_factor=p.pnl_factor,
                 ) for p in info.positions
             ]
 
@@ -380,15 +486,36 @@ class PhemexEngine:
     def _refresh_orders(self):
         try:
             raw = self.adapter.query_open_orders(self._symbol)
-            self._orders = [
-                Order(
-                    order_id=o.order_id, symbol=o.symbol,
-                    side=o.side, type=o.order_type,
-                    qty=float(o.qty), price=float(o.price),
-                    status="New" if o.status == "Created" else o.status,
-                    trigger_price=float(o.stop_price),
-                ) for o in raw
-            ]
+            new_orders = []
+            new_map = {}
+
+            for o in raw:
+                order_id = o.order_id
+                status = "New" if o.status == "Created" else o.status
+                
+                # Optimization: In-place update if order already exists
+                if order_id in self._order_map:
+                    order = self._order_map[order_id]
+                    order.qty = float(o.qty)
+                    order.price = float(o.price)
+                    order.status = status
+                    order.trigger_price = float(o.stop_price)
+                else:
+                    # New object only if it didn't exist
+                    order = Order(
+                        order_id=order_id, symbol=o.symbol,
+                        side=o.side, type=o.order_type,
+                        qty=float(o.qty), price=float(o.price),
+                        status=status,
+                        trigger_price=float(o.stop_price),
+                    )
+                
+                new_orders.append(order)
+                new_map[order_id] = order
+
+            self._orders = new_orders
+            self._order_map = new_map
+            self._active_ids = set(new_map.keys())
         except Exception:
             pass
 
@@ -402,27 +529,35 @@ class PhemexEngine:
 
     def _on_price(self, price: float, symbol: str = ""):
         """
-        Optimized PnL update.
-        If symbol is provided (from WebSocket), only updates that symbol.
+        Optimized PnL update (Ground Level).
+        Uses local binding and pnl_factor to reduce bytecode overhead.
         """
         self._price = price
-        target_symbol = symbol or self._symbol
+        target = symbol or self._symbol
         
-        for p in self._pos_map.get(target_symbol, []):
-            if p.size:
-                p.unrealized_pnl = (price - p.entry_price) * p.size * p.side_multiplier
+        # Local lookup binding
+        pos_list = self._pos_map.get(target, [])
+        for p in pos_list:
+            # Single multiplication logic
+            p.unrealized_pnl = (price - p.entry_price) * p.pnl_factor
 
     def _on_candles(self, candles: list[Candle]):
-        """O(1) update via internal map."""
-        for c in candles:
-            self._candle_map[c.time] = c
+        """Bulk update via C-level map update."""
+        if not candles:
+            return
 
-        # Maintain memory limit (Max 2000 candles)
-        if len(self._candle_map) > 2000:
+        self._candle_map.update({c.time: c for c in candles})
+        self._candles_dirty = True
+
+        # Phase 1.5 Optimization: Amortized Cleanup
+        # Instead of sorting every time we hit 2001, we wait until 2100 
+        # and purge 100 at once. Reduces cleanup cost by 100x.
+        if len(self._candle_map) > 2100:
             # Sort by time and keep newest 2000
             sorted_keys = sorted(self._candle_map.keys())
             for k in sorted_keys[:-2000]:
                 del self._candle_map[k]
+            self._candles_dirty = True
 
     def _on_ticker(self, ticker: TickerData):
         self._ticker = ticker
@@ -431,6 +566,9 @@ class PhemexEngine:
         self._wallet = wallet
 
     def _on_positions(self, positions: list[Position]):
+        for p in positions:
+            p.pnl_factor = p.size * p.side_multiplier
+        
         self._positions = positions
         # Update position map
         self._pos_map = {}
@@ -474,3 +612,9 @@ class PhemexEngine:
             self._orderbook.bids = [OrderbookLevel(p, s) for p, s in sorted(bid_map.items(), reverse=True)]
 
         self._orderbook.timestamp = data.get("timestamp", 0)
+
+    def _pipeline_requests(self, func, requests: list) -> list:
+        """Helper to execute multiple API calls concurrently."""
+        with ThreadPoolExecutor(max_workers=len(requests) or 1) as executor:
+            futures = [executor.submit(func, r) for r in requests]
+            return [f.result() for f in futures]

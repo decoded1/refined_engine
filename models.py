@@ -113,6 +113,7 @@ class PositionInfo:
     margin: float = 0.0
     pos_side: PositionSide = "Merged"
     side_multiplier: float = 1.0
+    pnl_factor: float = 0.0  # size * side_multiplier
 
 
 @dataclass(slots=True)
@@ -216,3 +217,4 @@ class Position:
     margin: float = 0.0
     pos_side: PositionSide = "Merged"
     side_multiplier: float = 1.0
+    pnl_factor: float = 0.0  # size * side_multiplier

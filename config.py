@@ -6,6 +6,8 @@ Mirrors engine/config.ts logic for Python diagnostics.
 import os
 import hmac
 import hashlib
+import queue
+import threading
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -69,6 +71,34 @@ def sign_hmac_bytes(secret_bytes: bytes, message_bytes: bytes) -> str:
         message_bytes,
         hashlib.sha256,
     ).hexdigest()
+
+
+# ── Async Logger (Phase 2 Optimization) ──────────────────────────────────────
+
+class AsyncLogger:
+    def __init__(self):
+        self._q = queue.Queue()
+        self._t = threading.Thread(target=self._worker, daemon=True)
+        self._t.start()
+        self.enabled = True
+
+    def _worker(self):
+        while True:
+            msg = self._q.get()
+            if msg is None: break
+            # Single blocking point moved to background thread
+            print(msg, flush=True)
+            self._q.task_done()
+
+    def log(self, prefix, msg):
+        if self.enabled:
+            self._q.put(f"[{prefix}] {msg}")
+
+    def shutdown(self):
+        self._q.put(None)
+        self._t.join(timeout=1.0)
+
+logger = AsyncLogger()
 
 
 # ── Validation ───────────────────────────────────────────────────────────────
