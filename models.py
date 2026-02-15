@@ -112,6 +112,7 @@ class PositionInfo:
     liquidation_price: float = 0.0
     margin: float = 0.0
     pos_side: PositionSide = "Merged"
+    side_multiplier: float = 1.0
 
 
 @dataclass(slots=True)
@@ -214,3 +215,4 @@ class Position:
     realized_pnl: float = 0.0
     margin: float = 0.0
     pos_side: PositionSide = "Merged"
+    side_multiplier: float = 1.0

@@ -62,7 +62,9 @@ class PhemexEngine:
         self._products: list[Product] = []
         self._wallet = Wallet()
         self._positions: list[Position] = []
+        self._pos_map: dict[str, list[Position]] = {} # Optimized lookup
         self._orders: list[Order] = []
+        self._orderbook = OrderbookSnapshot(symbol=symbol)
 
         # Components
         self.rest = RestClient()
@@ -74,11 +76,13 @@ class PhemexEngine:
 
         # Wire up WS callbacks
         self.ws.on_connected = self._on_ws_reconnect
-        self.ws.on_price_update = self._on_price
+        self.ws.on_price_update = lambda p: self._on_price(p, self._symbol)
         self.ws.on_candle_update = self._on_candles
         self.ws.on_ticker_update = self._on_ticker
         self.ws.on_wallet_update = self._on_wallet
         self.ws.on_positions_update = self._on_positions
+        self.ws.on_orderbook = self._on_orderbook
+        self.ws.on_tick = lambda p, s, t: self._on_price(p, s)
 
     # ═════════════════════════════════════════════════════════════════════════
     #  Lifecycle
@@ -141,8 +145,16 @@ class PhemexEngine:
                     liquidation_price=p.liquidation_price,
                     leverage=p.leverage, unrealized_pnl=p.unrealized_pnl,
                     margin=p.margin, pos_side=p.pos_side,
+                    side_multiplier=p.side_multiplier,
                 ) for p in info.positions
             ]
+            
+            # Update position map
+            self._pos_map = {}
+            for p in self._positions:
+                if p.symbol not in self._pos_map:
+                    self._pos_map[p.symbol] = []
+                self._pos_map[p.symbol].append(p)
 
             # Hydrate Orders
             raw_orders = f_orders.result()
@@ -289,7 +301,8 @@ class PhemexEngine:
         self.adapter.assign_position_balance(self._symbol, pos_side, balance)
 
     def get_orderbook(self) -> OrderbookSnapshot:
-        return self.adapter.query_orderbook(self._symbol)
+        """Returns the high-speed local L2 mirror (O(1))."""
+        return self._orderbook
 
     def get_order_history(self, limit: int = 20, offset: int = 0,
                           start: Optional[int] = None, end: Optional[int] = None) -> list[dict]:
@@ -345,8 +358,16 @@ class PhemexEngine:
                     leverage=p.leverage, unrealized_pnl=p.unrealized_pnl,
                     margin=p.margin,
                     pos_side=p.pos_side,
+                    side_multiplier=p.side_multiplier,
                 ) for p in info.positions
             ]
+
+            # Update position map
+            self._pos_map = {}
+            for p in self._positions:
+                if p.symbol not in self._pos_map:
+                    self._pos_map[p.symbol] = []
+                self._pos_map[p.symbol].append(p)
 
             # Auto-detect posSide logic if needed in future
             self._refresh_orders()
@@ -379,21 +400,17 @@ class PhemexEngine:
             _log("WS Reconnected: Refreshing state...")
             self._hydrate_account()
 
-    def _on_price(self, price: float):
+    def _on_price(self, price: float, symbol: str = ""):
+        """
+        Optimized PnL update.
+        If symbol is provided (from WebSocket), only updates that symbol.
+        """
         self._price = price
-        # Optimization: Client-side PnL calculation to avoid polling
-        for p in self._positions:
-            if not p.size:
-                continue
-
-            # Hedge Mode: Long=Buy, Short=Sell
-            # One-Way Mode: side=Buy (Long), side=Sell (Short)
-            is_long = (p.pos_side == "Long") or (p.pos_side == "Merged" and p.side == "Buy")
-
-            if is_long:
-                p.unrealized_pnl = (price - p.entry_price) * p.size
-            else:
-                p.unrealized_pnl = (p.entry_price - price) * p.size
+        target_symbol = symbol or self._symbol
+        
+        for p in self._pos_map.get(target_symbol, []):
+            if p.size:
+                p.unrealized_pnl = (price - p.entry_price) * p.size * p.side_multiplier
 
     def _on_candles(self, candles: list[Candle]):
         """O(1) update via internal map."""
@@ -415,3 +432,45 @@ class PhemexEngine:
 
     def _on_positions(self, positions: list[Position]):
         self._positions = positions
+        # Update position map
+        self._pos_map = {}
+        for p in self._positions:
+            if p.symbol not in self._pos_map:
+                self._pos_map[p.symbol] = []
+            self._pos_map[p.symbol].append(p)
+
+    def _on_orderbook(self, data: dict):
+        """
+        Maintains the local L2 mirror.
+        Phemex sends 'snapshot' or 'incremental' updates.
+        """
+        is_snapshot = data.get("type") == "snapshot"
+        book = data.get("orderbook_p", {})
+        
+        # 1. Parse Levels
+        new_asks = {float(a[0]): float(a[1]) for a in book.get("asks", [])}
+        new_bids = {float(b[0]): float(b[1]) for b in book.get("bids", [])}
+
+        if is_snapshot:
+            # Full replacement
+            self._orderbook.asks = [OrderbookLevel(p, s) for p, s in sorted(new_asks.items()) if s > 0]
+            self._orderbook.bids = [OrderbookLevel(p, s) for p, s in sorted(new_bids.items(), reverse=True) if s > 0]
+        else:
+            # Incremental update: Convert existing to maps for O(1) merge
+            ask_map = {l.price: l.size for l in self._orderbook.asks}
+            bid_map = {l.price: l.size for l in self._orderbook.bids}
+
+            # Apply updates
+            for p, s in new_asks.items():
+                if s == 0: ask_map.pop(p, None)
+                else: ask_map[p] = s
+            
+            for p, s in new_bids.items():
+                if s == 0: bid_map.pop(p, None)
+                else: bid_map[p] = s
+
+            # Sync back to sorted lists
+            self._orderbook.asks = [OrderbookLevel(p, s) for p, s in sorted(ask_map.items())]
+            self._orderbook.bids = [OrderbookLevel(p, s) for p, s in sorted(bid_map.items(), reverse=True)]
+
+        self._orderbook.timestamp = data.get("timestamp", 0)

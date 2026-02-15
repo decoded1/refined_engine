@@ -29,6 +29,9 @@ IS_TESTNET = _has_testnet and not _has_mainnet
 API_KEY = (TESTNET_KEY if IS_TESTNET else MAINNET_KEY).strip()
 API_SECRET = (TESTNET_SECRET if IS_TESTNET else MAINNET_SECRET).strip()
 
+API_KEY_BYTES = API_KEY.encode("utf-8")
+API_SECRET_BYTES = API_SECRET.encode("utf-8")
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 REST_BASE = (
@@ -55,6 +58,15 @@ def sign_hmac(secret: str, message: str) -> str:
     return hmac.new(
         secret.encode("utf-8"),
         message.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def sign_hmac_bytes(secret_bytes: bytes, message_bytes: bytes) -> str:
+    """Optimized HMAC-SHA256 signature using pre-encoded bytes."""
+    return hmac.new(
+        secret_bytes,
+        message_bytes,
         hashlib.sha256,
     ).hexdigest()
 

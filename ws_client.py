@@ -44,6 +44,8 @@ class WSClient:
         self._max_reconnects = 10
         self._current_symbol = "BTCUSDT"
         self._current_resolution = 60
+        self._ticker_fields: list[str] = []
+        self._ticker_index_map: dict[str, int] = {}
 
         # Async Dispatch Queue
         self._queue: queue.Queue = queue.Queue()
@@ -115,13 +117,24 @@ class WSClient:
 
     def disconnect(self):
         self._explicitly_closed = True
+        
+        # 1. Close WebSocket Connection
         if self._ws:
             self._ws.close()
-            self._ws = None
+        
+        # 2. Join WS Thread (give it 2s to finish teardown)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        self._ws = None
+        self._thread = None
         self._connected = False
-        # Stop processor thread
+
+        # 3. Shutdown Processor Thread
         if self._queue:
             self._queue.put(None)
+            if self._processor_thread and self._processor_thread.is_alive():
+                self._processor_thread.join(timeout=2.0)
+        self._processor_thread = None
 
     def update_subscription(self, symbol: str, resolution: int = 60):
         self._current_symbol = symbol
@@ -142,7 +155,8 @@ class WSClient:
 
     def _on_message(self, ws, data: str):
         """Put raw data into the queue for async processing."""
-        self._queue.put(data)
+        if not self._explicitly_closed:
+            self._queue.put(data)
 
     def _process_queue(self):
         """Background thread loop for processing messages and triggering callbacks."""
@@ -215,14 +229,23 @@ class WSClient:
         data = payload.get("data", [])
         if not fields or not data:
             return
-        si = fields.index("symbol") if "symbol" in fields else -1
+
+        # Optimization: Cache index mapping only if fields change
+        if fields != self._ticker_fields:
+            self._ticker_fields = fields
+            self._ticker_index_map = {f: i for i, f in enumerate(fields)}
+
+        si = self._ticker_index_map.get("symbol", -1)
         if si == -1:
             return
+
         row = next((r for r in data if r[si] == self._current_symbol), None)
         if not row:
             return
+
         def gv(k):
-            return float(row[fields.index(k)]) if k in fields and row[fields.index(k)] else 0.0
+            idx = self._ticker_index_map.get(k, -1)
+            return float(row[idx]) if idx != -1 and row[idx] else 0.0
         ticker = TickerData(
             symbol=self._current_symbol,
             last_price=gv("lastRp"), mark_price=gv("markRp"),
@@ -330,9 +353,10 @@ class WSClient:
             return
         self._send({"id": 101, "method": "kline_p.subscribe", "params": [symbol, resolution]})
         self._send({"id": 102, "method": "perp_market24h_pack_p.subscribe", "params": []})
+        self._send({"id": 106, "method": "orderbook_p.subscribe", "params": [symbol]})
         if self._api_key:
             self._send({"id": 103, "method": "aop_p.subscribe", "params": []})
-        _log(f"📊 Subscribed: {symbol} @ {resolution // 60}m")
+        _log(f"📊 Subscribed: {symbol} @ {resolution // 60}m + Orderbook")
 
     def _send(self, payload: dict):
         if self._ws:

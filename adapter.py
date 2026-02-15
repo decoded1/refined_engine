@@ -10,11 +10,12 @@ from __future__ import annotations
 import uuid
 import time
 import math
+import os
 import requests
 from typing import Optional
 from urllib.parse import urlencode
 
-from .config import REST_BASE, IS_TESTNET, sign_hmac
+from .config import REST_BASE, IS_TESTNET, sign_hmac, API_KEY_BYTES, API_SECRET_BYTES, sign_hmac_bytes
 from .models import (
     PlaceOrderRequest,
     AmendOrderRequest,
@@ -101,6 +102,8 @@ class PhemexAdapter:
 
         self._api_key = api_key
         self._api_secret = api_secret
+        self._api_key_bytes = API_KEY_BYTES if api_key == os.getenv("PHEMEX_TESTNET_KEY", os.getenv("PHEMEX_MAINNET_KEY")) else api_key.encode("utf-8")
+        self._api_secret_bytes = API_SECRET_BYTES if api_secret == os.getenv("PHEMEX_TESTNET_SECRET", os.getenv("PHEMEX_MAINNET_SECRET")) else api_secret.encode("utf-8")
         self._is_testnet = is_testnet
         self._base = base_url or REST_BASE
         self._rate_limit_used = 0.0  # 0-100%
@@ -108,34 +111,37 @@ class PhemexAdapter:
 
         # Cache for product precision specs (Symbol -> Product)
         self._products: dict[str, Product] = {}
+        self._qty_multipliers: dict[str, float] = {}
+        self._price_multipliers: dict[str, float] = {}
 
     def set_products(self, products: list[Product]):
         """Populate local cache of product specs for precision formatting."""
         self._products = {p.symbol: p for p in products}
+        self._qty_multipliers = {p.symbol: float(10**p.qty_precision) for p in products}
+        self._price_multipliers = {p.symbol: float(10**p.price_precision) for p in products}
 
     # ── Formatting Helpers ───────────────────────────────────────────────────
 
     def _fmt_qty(self, symbol: str, qty: float) -> str:
-        """Format quantity: Floor to step size, format to precision."""
+        """Format quantity: Floor to step size via multiplier."""
+        m = self._qty_multipliers.get(symbol)
         p = self._products.get(symbol)
-        if not p:
+        if m is None or p is None:
             return str(qty)
 
-        # Floor logic: 0.0019 for step 0.001 -> 0.001
-        # Added epsilon 1e-9 to handle float representation errors
-        steps = math.floor((qty + 1e-9) / p.qty_step_size)
-        truncated = steps * p.qty_step_size
+        # Using multiplier avoids float division overhead
+        truncated = math.floor(qty * m) / m
         return f"{truncated:.{p.qty_precision}f}"
 
     def _fmt_price(self, symbol: str, price: float) -> str:
-        """Format price: Round to tick size, format to precision."""
+        """Format price: Round to tick size via multiplier."""
+        m = self._price_multipliers.get(symbol)
         p = self._products.get(symbol)
-        if not p:
+        if m is None or p is None:
             return str(price)
 
-        # Round logic: 20000.18 for tick 0.1 -> 20000.2
-        steps = round(price / p.tick_size)
-        rounded = steps * p.tick_size
+        # Round via multiplier for speed and precision
+        rounded = round(price * m) / m
         return f"{rounded:.{p.price_precision}f}"
 
     # ── IExchange: Execution ─────────────────────────────────────────────────
@@ -332,16 +338,23 @@ class PhemexAdapter:
             if abs(size) == 0:
                 continue
 
+            side = p.get("side", "Buy")
+            pos_side = p.get("posSide", "Merged")
+            # Long if posSide is Long, OR Merged and side is Buy
+            is_long = (pos_side == "Long") or (pos_side == "Merged" and side == "Buy")
+            multiplier = 1.0 if is_long else -1.0
+
             positions.append(PositionInfo(
                 symbol=p.get("symbol", ""),
-                side=p.get("side", "Buy"),
+                side=side,
                 size=size,
                 entry_price=float(p.get("avgEntryPriceRp", "0")),
                 unrealized_pnl=float(p.get("unrealisedPnlRv", "0")),
                 leverage=float(p.get("leverageRr", p.get("leverageEr", "0"))),
                 liquidation_price=float(p.get("liquidationPriceRp", "0")),
                 margin=float(p.get("usedBalanceRv", "0")),
-                pos_side=p.get("posSide", "Merged"),
+                pos_side=pos_side,
+                side_multiplier=multiplier,
             ))
 
         return AccountInfo(
@@ -491,12 +504,9 @@ class PhemexAdapter:
         full_url = f"{self._base}{path}"
 
         # Signature: HMAC(endpoint + queryString + expiry)
-        # Optimization: Phemex requires unencoded commas in signature for lists
-        # even though they are encoded in the URL.
         query_string_sig = query_string.replace("%2C", ",")
-
         sign_string = f"{endpoint}{query_string_sig}{expiry}"
-        signature = sign_hmac(self._api_secret, sign_string)
+        signature = sign_hmac_bytes(self._api_secret_bytes, sign_string.encode("utf-8"))
 
         headers = {
             "x-phemex-access-token": self._api_key,
