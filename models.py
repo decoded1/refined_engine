@@ -174,6 +174,8 @@ class Product:
     qty_step_size: float = 0.001  # Min qty increment (e.g. 0.001 for BTC)
     price_precision: int = 2      # Decimals for price (e.g. 1 for BTC)
     qty_precision: int = 3        # Decimals for qty (e.g. 3 for BTC)
+    max_leverage: float = 100.0   # Risk Limit metadata
+    max_position_size: float = 0.0
 
 
 @dataclass(slots=True)
@@ -185,9 +187,29 @@ class OrderbookLevel:
 @dataclass(slots=True)
 class OrderbookSnapshot:
     symbol: str = ""
-    asks: list[OrderbookLevel] = field(default_factory=list)
-    bids: list[OrderbookLevel] = field(default_factory=list)
     timestamp: int = 0
+    ask_map: dict[float, float] = field(default_factory=dict) # price -> size
+    bid_map: dict[float, float] = field(default_factory=dict) # price -> size
+    _asks_cache: list[OrderbookLevel] = field(default_factory=list)
+    _bids_cache: list[OrderbookLevel] = field(default_factory=list)
+    _dirty: bool = field(default=True)
+
+    @property
+    def asks(self) -> list[OrderbookLevel]:
+        if self._dirty:
+            self._sync()
+        return self._asks_cache
+
+    @property
+    def bids(self) -> list[OrderbookLevel]:
+        if self._dirty:
+            self._sync()
+        return self._bids_cache
+
+    def _sync(self):
+        self._asks_cache = [OrderbookLevel(p, s) for p, s in sorted(self.ask_map.items())]
+        self._bids_cache = [OrderbookLevel(p, s) for p, s in sorted(self.bid_map.items(), reverse=True)]
+        self._dirty = False
 
 
 @dataclass(slots=True)

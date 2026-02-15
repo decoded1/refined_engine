@@ -15,6 +15,7 @@ import time
 import requests
 import socket
 import operator
+import orjson as json
 from typing import Optional
 
 from .config import REST_BASE, logger
@@ -58,23 +59,33 @@ class RestClient:
     # ── Products ─────────────────────────────────────────────────────────────
 
     def fetch_products(self) -> list[Product]:
-        """Fetch all listed perpetual products."""
+        """Fetch all listed perpetual products (Migrated to Products-Plus)."""
         try:
-            resp = self.session.get(f"{self.base}/public/products", timeout=10)
+            resp = self.session.get(f"{self.base}/public/products-plus", timeout=10)
             resp.raise_for_status()
-            json_data = resp.json()
+            json_data = json.loads(resp.content)
 
             if json_data.get("code") != 0 or not json_data.get("data"):
                 _err(f"Failed to fetch products: {json_data.get('msg')}")
                 return []
 
             data = json_data["data"]
-            # Phemex V2 API separates legacy products from V2 perps
+            # Phemex Plus API includes nested risk limits
+            risk_limits = {}
+            for entry in data.get("riskLimitsV2", []):
+                symbol = entry.get("symbol")
+                inner = entry.get("riskLimits", [{}])[0] # Get base tier
+                risk_limits[symbol] = {
+                    "limit": float(inner.get("limit", 0)),
+                    "maxLeverage": 1.0 / float(inner.get("initialMarginRr", 0.01))
+                }
+            
             list1 = data.get("products", [])
             list2 = data.get("perpProductsV2", [])
 
             products = []
             for p in [*list1, *list2]:
+                symbol = p["symbol"]
                 if p.get("status") != "Listed":
                     continue
 
@@ -83,14 +94,11 @@ class RestClient:
                 if p_type not in ("Perpetual", "PerpetualV2"):
                     continue
 
-                # Parse precision fields safely (defaults provided for safety)
                 tick_size = float(p.get("tickSize", "0.01"))
                 qty_step = float(p.get("qtyStepSize", "0.001"))
 
-                # Some Phemex endpoints return explicit precision ints, others imply it
                 p_prec = p.get("pricePrecision")
                 if p_prec is None:
-                    # Fallback: derive from tickSize (0.1 -> 1, 0.01 -> 2)
                     p_prec = 0
                     ts = tick_size
                     while ts < 1:
@@ -99,31 +107,33 @@ class RestClient:
 
                 q_prec = p.get("qtyPrecision")
                 if q_prec is None:
-                    # Fallback: derive from qtyStep (0.001 -> 3)
                     q_prec = 0
                     qs = qty_step
                     while qs < 1:
                         qs *= 10
                         q_prec += 1
 
+                # Extract Risk Limit data if available
+                rl = risk_limits.get(symbol, {})
+                max_lev = float(rl.get("maxLeverage", 100))
+                max_pos = float(rl.get("limit", 0))
+
                 products.append(Product(
-                    symbol=p["symbol"],
+                    symbol=symbol,
                     base_currency=p.get("baseCurrency", ""),
                     quote_currency=p.get("quoteCurrency", ""),
-
-                    # Legacy scaling (kept for backward compat if needed)
                     price_scale=p.get("priceScale", 4),
                     ratio_scale=p.get("ratioScale", 8),
                     value_scale=p.get("valueScale", 8),
-
-                    # V2 Precision Fields
                     tick_size=tick_size,
                     qty_step_size=qty_step,
                     price_precision=int(p_prec),
                     qty_precision=int(q_prec),
+                    max_leverage=max_lev,
+                    max_position_size=max_pos,
                 ))
 
-            _log(f"Loaded {len(products)} perpetual products")
+            _log(f"Loaded {len(products)} perpetual products with risk limits")
             return products
 
         except Exception as e:
@@ -141,7 +151,7 @@ class RestClient:
                 timeout=10,
             )
             resp.raise_for_status()
-            json_data = resp.json()
+            json_data = json.loads(resp.content)
 
             if json_data.get("error") or not json_data.get("result"):
                 _warn(f"Ticker fetch failed: {json_data.get('error')}")
@@ -174,7 +184,7 @@ class RestClient:
                 "limit": limit,
             }, timeout=10)
             resp.raise_for_status()
-            json_data = resp.json()
+            json_data = json.loads(resp.content)
 
             if json_data.get("code") != 0 or not json_data.get("data", {}).get("rows"):
                 return []
@@ -212,7 +222,7 @@ class RestClient:
                 "resolution": resolution,
             }, timeout=10)
             resp.raise_for_status()
-            json_data = resp.json()
+            json_data = json.loads(resp.content)
 
             if json_data.get("code") != 0 or not json_data.get("data", {}).get("rows"):
                 if json_data.get("code") != 0:
@@ -240,7 +250,7 @@ class RestClient:
                 timeout=10,
             )
             resp.raise_for_status()
-            json_data = resp.json()
+            json_data = json.loads(resp.content)
 
             if json_data.get("error"):
                 raise ValueError(json_data["error"].get("message", "Unknown error"))
@@ -261,37 +271,41 @@ class RestClient:
 
     # ── Internals ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _get_val(d: dict, primary: str, *fallbacks: str) -> float:
+        for key in (primary, *fallbacks):
+            if key in d:
+                v = d[key]
+                f = float(v) if v else 0.0
+                if f > 0: return f
+        return 0.0
+
+    @staticmethod
+    def _get_funding(d: dict, primary: str, *fallbacks: str) -> float:
+        for key in (primary, *fallbacks):
+            if key in d:
+                f = float(d[key]) if d[key] else 0.0
+                return f / 1e8 if abs(f) > 1 else f
+        return 0.0
+
     def _process_ticker(self, d: dict, symbol: str) -> TickerData:
         """Parse ticker response (handles Rp/Rv/Ep field name variants)."""
-        def val(primary: str, *fallbacks: str) -> float:
-            for key in (primary, *fallbacks):
-                if key in d:
-                    v = d[key]
-                    f = float(v) if v else 0.0
-                    if f > 0:
-                        return f
-            return 0.0
-
-        def funding(primary: str, *fallbacks: str) -> float:
-            for key in (primary, *fallbacks):
-                if key in d:
-                    f = float(d[key]) if d[key] else 0.0
-                    return f / 1e8 if abs(f) > 1 else f
-            return 0.0
+        gv = self._get_val
+        gf = self._get_funding
 
         return TickerData(
             symbol=symbol,
-            last_price=val("lastRp", "last", "lastPrice", "closeRp"),
-            mark_price=val("markRp", "markPrice", "markPriceRp"),
-            index_price=val("indexRp", "indexPrice", "indexLastPriceRp"),
-            high_24h=val("highRp", "high", "highPriceRp"),
-            low_24h=val("lowRp", "low", "lowPriceRp"),
-            volume_24h=val("volumeRq", "volume", "volume24h", "turnoverRv"),
-            open_interest=val("openInterestRv", "openInterest"),
-            funding_rate=funding("fundingRateRr", "fundingRate"),
-            pred_funding_rate=funding("predFundingRateRr", "predFundingRate"),
-            bid=val("bidRp", "bid"),
-            ask=val("askRp", "ask"),
+            last_price=gv(d, "lastRp", "last", "lastPrice", "closeRp"),
+            mark_price=gv(d, "markRp", "markPrice", "markPriceRp"),
+            index_price=gv(d, "indexRp", "indexPrice", "indexLastPriceRp"),
+            high_24h=gv(d, "highRp", "high", "highPriceRp"),
+            low_24h=gv(d, "lowRp", "low", "lowPriceRp"),
+            volume_24h=gv(d, "volumeRq", "volume", "volume24h", "turnoverRv"),
+            open_interest=gv(d, "openInterestRv", "openInterest"),
+            funding_rate=gf(d, "fundingRateRr", "fundingRate"),
+            pred_funding_rate=gf(d, "predFundingRateRr", "predFundingRate"),
+            bid=gv(d, "bidRp", "bid"),
+            ask=gv(d, "askRp", "ask"),
         )
 
     # Optimized item extractor for candle rows

@@ -44,6 +44,7 @@ class WSClient:
         self._reconnect_attempts = 0
         self._max_reconnects = 10
         self._current_symbol = "BTCUSDT"
+        self._current_symbol_bytes = self._current_symbol.encode("utf-8")
         self._current_resolution = 60
         self._ticker_fields: list[str] = []
         self._ticker_index_map: dict[str, int] = {}
@@ -89,6 +90,7 @@ class WSClient:
 
     def connect(self, symbol: str = "BTCUSDT", resolution: int = 60):
         self._current_symbol = symbol
+        self._current_symbol_bytes = symbol.encode("utf-8")
         self._current_resolution = resolution
         self._explicitly_closed = False
         if self._connected:
@@ -147,6 +149,7 @@ class WSClient:
 
     def update_subscription(self, symbol: str, resolution: int = 60):
         self._current_symbol = symbol
+        self._current_symbol_bytes = symbol.encode("utf-8")
         self._current_resolution = resolution
         self._subscribe_market(symbol, resolution)
 
@@ -166,6 +169,9 @@ class WSClient:
         """Put raw data into the queue for async processing with high-speed pre-scan."""
         if self._explicitly_closed:
             return
+
+        # Phase 2 Debug: Trace arrival
+        # print(f"[WS DEBUG] Arrival: {data[:50]}...") 
 
         # Optimization: Pre-scan for symbol or control keys (id, method, result, error)
         # This discards noise from other symbols in nanoseconds without parsing JSON.
@@ -214,6 +220,7 @@ class WSClient:
             handled = False
             for key, handler in self._dispatch_keys:
                 if key in msg:
+                    # print(f"[WS DEBUG] Processing Key: {key}")
                     try:
                         handler(msg if key in ("trades_p", "orderbook_p", "accounts_p", "positions_p") else msg[key])
                     except Exception as e:
@@ -251,8 +258,8 @@ class WSClient:
             self.on_price_update(candles[-1].close)
 
     def _handle_ticker(self, payload: dict):
-        fields = payload.get("fields", [])
-        data = payload.get("data", [])
+        fields = payload.get("fields")
+        data = payload.get("data")
         if not fields or not data:
             return
 
@@ -265,8 +272,16 @@ class WSClient:
         if si == -1:
             return
 
-        row = next((r for r in data if r[si] == self._current_symbol), None)
-        if not row:
+        # Optimization: Target-Aware Search
+        # We only care about our active symbol. This avoids processing 500+ rows.
+        target = self._current_symbol
+        target_row = None
+        for row in data:
+            if row[si] == target:
+                target_row = row
+                break
+        
+        if not target_row:
             return
 
         # Optimization: Local binding and Lazy Float parsing
@@ -276,14 +291,12 @@ class WSClient:
         def gv(k):
             idx = idx_map.get(k, -1)
             if idx == -1: return 0.0
-            val_str = row[idx]
+            val_str = target_row[idx]
             if not val_str: return 0.0
             
-            # Lazy check: If string matches last seen, return cached float
             if val_str in cache:
                 return cache[val_str]
             
-            # Parse once and cache
             f_val = float(val_str)
             cache[val_str] = f_val
             return f_val

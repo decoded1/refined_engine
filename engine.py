@@ -18,10 +18,12 @@ import time
 import gc
 import os
 import array
+import sys
+import asyncio
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
-from .config import API_KEY, API_SECRET, IS_TESTNET, NETWORK, logger
+from .config import API_KEY, API_SECRET, IS_TESTNET, NETWORK, logger, REST_VIP, WS_VIP
 from .models import (
     Candle, TickerData, Product, Wallet, Position, Order,
     OrderResult, OrderbookSnapshot, PlaceOrderRequest,
@@ -51,12 +53,18 @@ class PhemexEngine:
         resolution: int = 60,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
+        use_vip: bool = False,
     ):
-        self._symbol = symbol
+        self._symbol = sys.intern(symbol)
+        self._symbol_bytes = self._symbol.encode("utf-8")
         self._resolution = resolution
         self._api_key = api_key or API_KEY or ""
         self._api_secret = api_secret or API_SECRET or ""
         self._booted = False
+
+        # VIP logic
+        rest_url = REST_VIP if use_vip and not IS_TESTNET else None
+        ws_url = WS_VIP if use_vip and not IS_TESTNET else None
 
         # State
         self._price: float = 0.0
@@ -83,9 +91,10 @@ class PhemexEngine:
         self._orderbook = OrderbookSnapshot(symbol=symbol)
 
         # Components
-        self.rest = RestClient()
-        self.ws = WSClient()
-        self.adapter = PhemexAdapter(self._api_key, self._api_secret)
+        self.rest = RestClient(base_url=rest_url)
+        self.ws = WSClient(ws_url=ws_url)
+        self.adapter = PhemexAdapter(self._api_key, self._api_secret, use_vip=use_vip)
+        self._executor = ThreadPoolExecutor(max_workers=8) # Persistent worker pool
 
         if not self._api_key or not self._api_secret:
             _warn("No API credentials. Execution will fail.")
@@ -127,16 +136,14 @@ class PhemexEngine:
         now = int(time.time())
         self.ws.set_credentials(self._api_key, self._api_secret)
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            # 1. Start all REST requests in parallel
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            # 1. Start all REST requests in parallel (History removed)
             f_prods = executor.submit(self.rest.fetch_products)
             f_ticker = executor.submit(self.rest.fetch_ticker, self._symbol)
-            f_candles = executor.submit(self.rest.fetch_historical_candles, 
-                                        self._symbol, now, self._resolution, 500)
             f_account = executor.submit(self.adapter.get_account_info)
             f_orders = executor.submit(self.adapter.query_open_orders, self._symbol)
 
-            # 2. While waiting, connect WebSocket (takes ~100ms-1s)
+            # 2. While waiting, connect WebSocket (Triggers 2,000 candle burst)
             self.ws.connect(self._symbol, self._resolution)
 
             # 3. Gather Results and Hydrate State
@@ -149,15 +156,6 @@ class PhemexEngine:
                 p = ticker.last_price or ticker.mark_price
                 if p > 0:
                     self._price = p
-
-            candles = f_candles.result()
-            if candles:
-                self._candle_map = {c.time: c for c in candles}
-                self._candles_dirty = True
-                if self._price == 0 and candles:
-                    # Sort to find latest close for initial price
-                    latest = sorted(candles, key=lambda c: c.time)[-1]
-                    self._price = latest.close
 
             # Hydrate Wallet & Positions
             info = f_account.result()
@@ -206,13 +204,22 @@ class PhemexEngine:
         _log(f"✅ Boot complete. Account: ${self._wallet.balance:,.2f} | "
              f"{len(self._positions)} positions | {len(self._orders)} orders")
 
+    async def boot_async(self):
+        """Asynchronous boot wrapper (non-blocking)."""
+        await asyncio.to_thread(self.boot)
+
     def shutdown(self):
         """Clean shutdown."""
         self.ws.disconnect()
+        self._executor.shutdown(wait=False)
         self._booted = False
         gc.enable() # Re-enable system GC
         _log("Shutdown complete.")
         # logger.shutdown() # Optional: keep alive if other engines exist
+
+    async def shutdown_async(self):
+        """Asynchronous shutdown wrapper (non-blocking)."""
+        await asyncio.to_thread(self.shutdown)
 
     def switch_symbol(self, symbol: str):
         """Switch active trading symbol."""
@@ -312,43 +319,73 @@ class PhemexEngine:
     def market_buy(self, qty: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Buy", "Market", qty, pos_side=pos_side)
 
+    async def market_buy_async(self, qty: float, pos_side: str = "Merged") -> OrderResult:
+        return await asyncio.to_thread(self.market_buy, qty, pos_side)
+
     def market_buy_batch(self, qtys: list[float], pos_side: str = "Merged") -> list[OrderResult]:
         """Place multiple market buy orders in parallel."""
         reqs = [PlaceOrderRequest(self._symbol, "Buy", "Market", q, pos_side=pos_side) for q in qtys]
         return self._pipeline_requests(self.adapter.place_order, reqs)
 
+    async def market_buy_batch_async(self, qtys: list[float], pos_side: str = "Merged") -> list[OrderResult]:
+        return await asyncio.to_thread(self.market_buy_batch, qtys, pos_side)
+
     def market_sell(self, qty: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Sell", "Market", qty, pos_side=pos_side)
+
+    async def market_sell_async(self, qty: float, pos_side: str = "Merged") -> OrderResult:
+        return await asyncio.to_thread(self.market_sell, qty, pos_side)
 
     def market_sell_batch(self, qtys: list[float], pos_side: str = "Merged") -> list[OrderResult]:
         """Place multiple market sell orders in parallel."""
         reqs = [PlaceOrderRequest(self._symbol, "Sell", "Market", q, pos_side=pos_side) for q in qtys]
         return self._pipeline_requests(self.adapter.place_order, reqs)
 
+    async def market_sell_batch_async(self, qtys: list[float], pos_side: str = "Merged") -> list[OrderResult]:
+        return await asyncio.to_thread(self.market_sell_batch, qtys, pos_side)
+
     def limit_buy(self, qty: float, price: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Buy", "Limit", qty, price, pos_side=pos_side)
+
+    async def limit_buy_async(self, qty: float, price: float, pos_side: str = "Merged") -> OrderResult:
+        return await asyncio.to_thread(self.limit_buy, qty, price, pos_side)
 
     def limit_buy_batch(self, orders: list[tuple[float, float]], pos_side: str = "Merged") -> list[OrderResult]:
         """Place multiple limit buy orders (qty, price) in parallel."""
         reqs = [PlaceOrderRequest(self._symbol, "Buy", "Limit", q, p, pos_side=pos_side) for q, p in orders]
         return self._pipeline_requests(self.adapter.place_order, reqs)
 
+    async def limit_buy_batch_async(self, orders: list[tuple[float, float]], pos_side: str = "Merged") -> list[OrderResult]:
+        return await asyncio.to_thread(self.limit_buy_batch, orders, pos_side)
+
     def limit_sell(self, qty: float, price: float, pos_side: str = "Merged") -> OrderResult:
         return self._place("Sell", "Limit", qty, price, pos_side=pos_side)
+
+    async def limit_sell_async(self, qty: float, price: float, pos_side: str = "Merged") -> OrderResult:
+        return await asyncio.to_thread(self.limit_sell, qty, price, pos_side)
 
     def limit_sell_batch(self, orders: list[tuple[float, float]], pos_side: str = "Merged") -> list[OrderResult]:
         """Place multiple limit sell orders (qty, price) in parallel."""
         reqs = [PlaceOrderRequest(self._symbol, "Sell", "Limit", q, p, pos_side=pos_side) for q, p in orders]
         return self._pipeline_requests(self.adapter.place_order, reqs)
 
+    async def limit_sell_batch_async(self, orders: list[tuple[float, float]], pos_side: str = "Merged") -> list[OrderResult]:
+        return await asyncio.to_thread(self.limit_sell_batch, orders, pos_side)
+
     def cancel_order(self, order_id: str, pos_side: str = "Merged") -> None:
         self.adapter.cancel_order(CancelOrderRequest(
             symbol=self._symbol, order_id=order_id, pos_side=pos_side
         ))
 
+    async def cancel_order_async(self, order_id: str, pos_side: str = "Merged") -> None:
+        await asyncio.to_thread(self.cancel_order, order_id, pos_side)
+
     def cancel_orders(self, order_ids: list[str], pos_side: str = "Merged") -> None:
         """Bulk cancel specific orders."""
         self.adapter.cancel_orders(self._symbol, order_ids, pos_side=pos_side)
+
+    async def cancel_orders_async(self, order_ids: list[str], pos_side: str = "Merged") -> None:
+        await asyncio.to_thread(self.cancel_orders, order_ids, pos_side)
 
     def cancel_all(self, pos_side: Optional[str] = None) -> None:
         """
@@ -367,6 +404,9 @@ class PhemexEngine:
                 # Silently skip if a particular side/mode is invalid for this symbol
                 pass
 
+    async def cancel_all_async(self, pos_side: Optional[str] = None) -> None:
+        await asyncio.to_thread(self.cancel_all, pos_side)
+
     def amend_order(
         self, order_id: str,
         new_price: Optional[float] = None,
@@ -377,6 +417,14 @@ class PhemexEngine:
             symbol=self._symbol, order_id=order_id,
             price=new_price, qty=new_qty, pos_side=pos_side,
         ))
+
+    async def amend_order_async(
+        self, order_id: str,
+        new_price: Optional[float] = None,
+        new_qty: Optional[float] = None,
+        pos_side: str = "Merged",
+    ) -> OrderResult:
+        return await asyncio.to_thread(self.amend_order, order_id, new_price, new_qty, pos_side)
 
     def amend_orders_batch(self, updates: list[dict]) -> list[OrderResult]:
         """
@@ -394,6 +442,9 @@ class PhemexEngine:
         ]
         return self._pipeline_requests(self.adapter.amend_order, reqs)
 
+    async def amend_orders_batch_async(self, updates: list[dict]) -> list[OrderResult]:
+        return await asyncio.to_thread(self.amend_orders_batch, updates)
+
     def set_leverage(self, leverage: int) -> None:
         self.adapter.set_leverage(self._symbol, leverage)
 
@@ -408,6 +459,23 @@ class PhemexEngine:
     def get_orderbook(self) -> OrderbookSnapshot:
         """Returns the high-speed local L2 mirror (O(1))."""
         return self._orderbook
+
+    @property
+    def asks(self) -> list[OrderbookLevel]:
+        """Returns lazy-sorted list of asks."""
+        return self._orderbook.asks
+
+    @property
+    def bids(self) -> list[OrderbookLevel]:
+        """Returns lazy-sorted list of bids."""
+        return self._orderbook.bids
+
+    def get_volume_at(self, price: float, side: str = "Buy") -> float:
+        """Returns the volume at a specific price level (O(1))."""
+        book = self._orderbook
+        if side == "Buy":
+            return book.bid_map.get(price, 0.0)
+        return book.ask_map.get(price, 0.0)
 
     def get_order_history(self, limit: int = 20, offset: int = 0,
                           start: Optional[int] = None, end: Optional[int] = None) -> list[dict]:
@@ -542,18 +610,23 @@ class PhemexEngine:
             p.unrealized_pnl = (price - p.entry_price) * p.pnl_factor
 
     def _on_candles(self, candles: list[Candle]):
-        """Bulk update via C-level map update."""
+        """Offloads heavy bulk update to the background executor (Non-blocking)."""
         if not candles:
             return
+        self._executor.submit(self._handle_candle_burst, candles)
 
+    def _handle_candle_burst(self, candles: list[Candle]):
+        """Internal background task for candle map maintenance."""
         self._candle_map.update({c.time: c for c in candles})
         self._candles_dirty = True
 
+        # Phase 1 Ground Level: If price is unknown, use the latest candle close
+        if self._price == 0:
+            latest = sorted(candles, key=lambda x: x.time)[-1]
+            self._price = latest.close
+
         # Phase 1.5 Optimization: Amortized Cleanup
-        # Instead of sorting every time we hit 2001, we wait until 2100 
-        # and purge 100 at once. Reduces cleanup cost by 100x.
         if len(self._candle_map) > 2100:
-            # Sort by time and keep newest 2000
             sorted_keys = sorted(self._candle_map.keys())
             for k in sorted_keys[:-2000]:
                 del self._candle_map[k]
@@ -579,7 +652,7 @@ class PhemexEngine:
 
     def _on_orderbook(self, data: dict):
         """
-        Maintains the local L2 mirror.
+        Maintains the local L2 mirror with O(1) price maps.
         Phemex sends 'snapshot' or 'incremental' updates.
         """
         is_snapshot = data.get("type") == "snapshot"
@@ -591,12 +664,12 @@ class PhemexEngine:
 
         if is_snapshot:
             # Full replacement
-            self._orderbook.asks = [OrderbookLevel(p, s) for p, s in sorted(new_asks.items()) if s > 0]
-            self._orderbook.bids = [OrderbookLevel(p, s) for p, s in sorted(new_bids.items(), reverse=True) if s > 0]
+            self._orderbook.ask_map = {p: s for p, s in new_asks.items() if s > 0}
+            self._orderbook.bid_map = {p: s for p, s in new_bids.items() if s > 0}
         else:
-            # Incremental update: Convert existing to maps for O(1) merge
-            ask_map = {l.price: l.size for l in self._orderbook.asks}
-            bid_map = {l.price: l.size for l in self._orderbook.bids}
+            # Incremental update: O(1) merge into maps
+            ask_map = self._orderbook.ask_map
+            bid_map = self._orderbook.bid_map
 
             # Apply updates
             for p, s in new_asks.items():
@@ -607,10 +680,7 @@ class PhemexEngine:
                 if s == 0: bid_map.pop(p, None)
                 else: bid_map[p] = s
 
-            # Sync back to sorted lists
-            self._orderbook.asks = [OrderbookLevel(p, s) for p, s in sorted(ask_map.items())]
-            self._orderbook.bids = [OrderbookLevel(p, s) for p, s in sorted(bid_map.items(), reverse=True)]
-
+        self._orderbook._dirty = True
         self._orderbook.timestamp = data.get("timestamp", 0)
 
     def _pipeline_requests(self, func, requests: list) -> list:

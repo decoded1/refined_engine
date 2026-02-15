@@ -11,12 +11,15 @@ import uuid
 import time
 import math
 import os
+import hmac
+import hashlib
 import requests
 import socket
+import orjson as json
 from typing import Optional
 from urllib.parse import urlencode
 
-from .config import REST_BASE, IS_TESTNET, sign_hmac, API_KEY_BYTES, API_SECRET_BYTES, sign_hmac_bytes, logger
+from .config import REST_BASE, IS_TESTNET, sign_hmac, API_KEY_BYTES, API_SECRET_BYTES, sign_hmac_bytes, logger, REST_VIP
 from .models import (
     PlaceOrderRequest,
     AmendOrderRequest,
@@ -44,43 +47,43 @@ def _warn(msg: str):
 # ── Raw Order Type (Phemex-native format) ────────────────────────────────────
 
 class RawOpenOrder(dict):
-    """Dict subclass for Phemex raw order data with convenient accessors."""
+    """Dict subclass for Phemex raw order data with direct accessors."""
 
     @property
     def order_id(self) -> str:
-        return str(self.get("orderID") or self.get("orderId") or "")
+        return self.get("orderID") or self.get("orderId") or ""
 
     @property
     def cl_ord_id(self) -> str:
-        return str(self.get("clOrdID") or self.get("clOrdId") or "")
+        return self.get("clOrdID") or self.get("clOrdId") or ""
 
     @property
     def symbol(self) -> str:
-        return str(self.get("symbol") or "")
+        return self.get("symbol") or ""
 
     @property
     def side(self) -> str:
-        return str(self.get("side") or "")
+        return self.get("side") or ""
 
     @property
     def price(self) -> str:
-        return str(self.get("priceRp") or self.get("priceEp") or "0")
+        return self.get("priceRp") or self.get("priceEp") or "0"
 
     @property
     def qty(self) -> str:
-        return str(self.get("orderQtyRq") or self.get("orderQty") or "0")
+        return self.get("orderQtyRq") or self.get("orderQty") or "0"
 
     @property
     def order_type(self) -> str:
-        return str(self.get("ordType") or self.get("orderType") or "")
+        return self.get("ordType") or self.get("orderType") or ""
 
     @property
     def status(self) -> str:
-        return str(self.get("ordStatus") or "")
+        return self.get("ordStatus") or ""
 
     @property
     def stop_price(self) -> str:
-        return str(self.get("stopPxRp") or "0")
+        return self.get("stopPxRp") or "0"
 
 
 # ── The Adapter ──────────────────────────────────────────────────────────────
@@ -97,6 +100,7 @@ class PhemexAdapter:
         api_secret: str,
         is_testnet: bool = IS_TESTNET,
         base_url: Optional[str] = None,
+        use_vip: bool = False,
     ):
         self.name = "PhemexAdapter"
         self.is_simulated = is_testnet
@@ -106,7 +110,15 @@ class PhemexAdapter:
         self._api_key_bytes = API_KEY_BYTES if api_key == os.getenv("PHEMEX_TESTNET_KEY", os.getenv("PHEMEX_MAINNET_KEY")) else api_key.encode("utf-8")
         self._api_secret_bytes = API_SECRET_BYTES if api_secret == os.getenv("PHEMEX_TESTNET_SECRET", os.getenv("PHEMEX_MAINNET_SECRET")) else api_secret.encode("utf-8")
         self._is_testnet = is_testnet
-        self._base = base_url or REST_BASE
+        
+        # Optimization: Choose base URL (VIP or Public)
+        if base_url:
+            self._base = base_url
+        elif use_vip and not is_testnet:
+            self._base = REST_VIP
+        else:
+            self._base = REST_BASE
+
         self._rate_limit_used = 0.0  # 0-100%
         self.session = requests.Session()
 
@@ -120,6 +132,7 @@ class PhemexAdapter:
 
         # Cache for product precision specs (Symbol -> Product)
         self._products: dict[str, Product] = {}
+        self._symbol_bytes: dict[str, bytes] = {}
         self._qty_multipliers: dict[str, float] = {}
         self._price_multipliers: dict[str, float] = {}
 
@@ -134,6 +147,10 @@ class PhemexAdapter:
         self._cl_id_counter = 0
         self._last_now = int(time.time())
 
+        # Ground Level: Zero-Copy Crypto
+        self._hmac_context = hmac.new(self._api_secret_bytes, digestmod=hashlib.sha256)
+        self._ts_cache: dict[int, bytes] = {} # {ts_int: ts_bytes}
+
         # Optimization: Pre-encoded Path Cache
         self._path_cache = {
             "/g-orders/create": "/g-orders/create".encode("utf-8"),
@@ -143,9 +160,28 @@ class PhemexAdapter:
             "/g-accounts/accountPositions": "/g-accounts/accountPositions".encode("utf-8"),
         }
 
+        # Optimization: Pre-allocated Header Template
+        self._header_template = {
+            "x-phemex-access-token": self._api_key,
+        }
+
+        # Phase 1 Ground Level: Fast-Path Serializer Keys
+        self._param_keys = {
+            "symbol": "symbol=",
+            "side": "&side=",
+            "orderQtyRq": "&orderQtyRq=",
+            "ordType": "&ordType=",
+            "priceRp": "&priceRp=",
+            "clOrdID": "&clOrdID=",
+            "posSide": "&posSide=",
+            "timeInForce": "&timeInForce=",
+            "reduceOnly": "&reduceOnly=",
+        }
+
     def set_products(self, products: list[Product]):
         """Populate local cache of product specs for precision formatting."""
         self._products = {p.symbol: p for p in products}
+        self._symbol_bytes = {p.symbol: p.symbol.encode("utf-8") for p in products}
         self._qty_multipliers = {p.symbol: float(10**p.qty_precision) for p in products}
         self._price_multipliers = {p.symbol: float(10**p.price_precision) for p in products}
 
@@ -527,51 +563,84 @@ class PhemexAdapter:
             _warn(f"Failed to fetch orderbook: {e}")
             return OrderbookSnapshot(symbol=symbol)
 
+    def _fast_urlencode(self, params: dict) -> str:
+        """High-speed URL serializer for standard order payloads."""
+        pk = self._param_keys
+        try:
+            # Explicit builder for the 'Standard Order' hot-path
+            # symbol is always first (no &)
+            parts = [pk["symbol"], params["symbol"]]
+            
+            for k, v in params.items():
+                if k == "symbol": continue
+                if k in pk:
+                    parts.extend([pk[k], str(v)])
+                else:
+                    # Fallback if an advanced/unknown parameter is present
+                    return urlencode(params)
+            return "".join(parts)
+        except KeyError:
+            return urlencode(params)
+
     # ── Internal: Signed Request ─────────────────────────────────────────────
 
     def _request(self, method: str, endpoint: str, params: Optional[dict] = None) -> dict:
-        """Make an authenticated request with HMAC-SHA256 signing."""
+        """Make an authenticated request with HMAC-SHA256 signing (Zero-Copy)."""
         params = params or {}
         
         # Ground Level: Local attribute binding
         base = self._base
         last_now = self._last_now
-        secret_bytes = self._api_secret_bytes
         path_cache = self._path_cache
+        ts_cache = self._ts_cache
 
         # Optimization: Clock-step caching
         now = int(time.time())
         if now > last_now:
             self._last_now = now
             last_now = now
+        
         expiry = last_now + 60
+        
+        # Optimization: Clock-Step Timestamp Byte Caching
+        if expiry in ts_cache:
+            expiry_bytes = ts_cache[expiry]
+        else:
+            expiry_bytes = str(expiry).encode("utf-8")
+            ts_cache[expiry] = expiry_bytes
+            if len(ts_cache) > 10:
+                old_keys = [k for k in ts_cache.keys() if k < last_now]
+                for k in old_keys: del ts_cache[k]
 
         # Phemex G-API uses query string for all methods
-        query_string = urlencode(params)
+        # Optimization: High-speed Fast-Path Serializer
+        query_string = self._fast_urlencode(params)
         path = "".join([endpoint, "?", query_string]) if query_string else endpoint
         full_url = "".join([base, path])
 
         # Signature: HMAC(endpoint + queryString + expiry)
         query_string_sig = query_string.replace("%2C", ",")
         
-        # Optimization: Use pre-encoded path if available
+        # Optimization: Use pre-encoded path and context copying
         end_bytes = path_cache.get(endpoint) or endpoint.encode("utf-8")
-        sign_string_bytes = "".join([query_string_sig, str(expiry)]).encode("utf-8")
+        msg_bytes = b"".join([end_bytes, query_string_sig.encode("utf-8"), expiry_bytes])
         
-        signature = sign_hmac_bytes(secret_bytes, b"".join([end_bytes, sign_string_bytes]))
+        # Fast HMAC Copy-then-Update
+        h = self._hmac_context.copy()
+        h.update(msg_bytes)
+        signature = h.hexdigest()
 
-        headers = {
-            "x-phemex-access-token": self._api_key,
-            "x-phemex-request-expiry": str(expiry),
-            "x-phemex-request-signature": signature,
-        }
+        # Optimization: Use isolated copy of header dictionary
+        headers = self._header_template.copy()
+        headers["x-phemex-request-expiry"] = expiry_bytes.decode("utf-8")
+        headers["x-phemex-request-signature"] = signature
 
         # Rate Limit Safety
         if self._rate_limit_used > 95:
             time.sleep(1.0)
 
         resp = self.session.request(method, full_url, headers=headers, timeout=10)
-        json_data = resp.json()
+        json_data = json.loads(resp.content)
 
         # Rate limit tracking
         remaining = resp.headers.get("x-ratelimit-remaining-contract")

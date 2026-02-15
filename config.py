@@ -42,6 +42,8 @@ REST_BASE = (
 WS_URL = (
     "wss://testnet-api.phemex.com/ws" if IS_TESTNET else "wss://ws.phemex.com"
 )
+REST_VIP = "https://vapi.phemex.com"
+WS_VIP = "wss://vapi.phemex.com/ws"
 NETWORK = "TESTNET" if IS_TESTNET else "MAINNET"
 
 EXCHANGE = {
