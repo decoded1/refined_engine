@@ -1,0 +1,249 @@
+overview | Overview
+general-api-information | General API information
+rest-api-standards | REST API Standards
+http-return-codes | HTTP return codes
+rest-request-header | REST request header
+endpoint-security-type | Endpoint security type
+signature-example-1-http-get-request | Signature example 1: HTTP GET request
+singature-example-2-http-get-request-with-multiple-query-string | Singature example 2: HTTP GET request with multiple query string
+signature-example-3-http-post-request | Signature example 3: HTTP POST request
+rest-response-format | REST response format
+rate-limits | Rate limits
+ip-ratelimits | IP ratelimits
+rest-api-ratelimit-rules | REST API ratelimit rules
+new-contract-api-ratelimit-rules-for-vapi-vip-only | New Contract API RateLimit Rules (for VAPI/VIP only)
+api-groups | API groups
+contact-us | Contact us
+ccxt-integration | CCXT integration
+code-samples | Code samples
+error-codes | Error codes
+cxlrejreason-field | CxlRejReason field
+bizerror-field | BizError field
+coin-m-perpetual-rest-api | COIN-M Perpetual REST API
+query-product-information | Query product information | GET /public/products
+request-response-field-explanation | Request/Response field explanation
+leverage | Leverage
+cross-margin-mode | Cross margin mode
+isolated-margin-mode | Isolated margin mode
+price-ratio-value-scales | Price/Ratio/Value scales
+query-server-time | Query server time | GET /public/time
+common-order-fields | Common order fields
+more-order-fields-explained | More order fields explained
+place-order-http-put-prefered | Place order (HTTP PUT, prefered) | PUT /orders/create
+place-order-http-post | Place order (HTTP POST)
+more-order-type-examples | More order type examples
+amend-order-by-order-id | Amend order by order ID
+cancel-order-by-order-id-or-client-order-id | Cancel order by order ID or client order ID | DELETE /orders/cancel
+bulk-cancel-orders | Bulk cancel orders | DELETE /orders
+cancel-all-orders | Cancel all orders | DELETE /orders/all
+query-trading-account-and-positions | Query trading account and positions | GET /accounts/accountPositions
+query-trading-account-and-positions-with-realtime-unpnl | Query trading account and positions with realtime unPnL | GET /accounts/positions
+set-leverage | Set leverage | PUT /positions/leverage
+set-position-risklimit | Set position risklimit | PUT /positions/riskLimit
+assign-position-balance-in-isolated-marign-mode | Assign position balance in isolated marign mode | POST /positions/assign
+query-open-orders-by-symbol | Query open orders by symbol | GET /orders/activeList
+query-closed-orders-by-symbol | Query closed orders by symbol | GET /exchange/order/list
+query-user-order-by-order-id-or-client-order-id | Query user order by order ID or client order ID
+query-user-trade | Query user trade | GET /exchange/order/trade
+query-order-book | Query order book | GET /md/orderbook
+query-full-order-book | Query full order book | GET /md/fullbook
+query-kline | Query kline | GET /exchange/public/md/kline
+query-recent-trades | Query recent trades | GET /md/trade
+query-24-hours-ticker | Query 24 hours ticker | GET /md/v1/ticker/24hr
+query-24-hours-ticker-for-all-symbols | Query 24 hours ticker for all symbols
+query-history-trades-by-symbol | Query history trades by symbol | GET /exchange/public/nomics/trades
+query-funding-rate-history | Query funding rate history | GET /api-data/public/data/funding-rate-history
+query-funding-fee-history | Query funding fee history | GET /api-data/futures/funding-fees
+query-contract-fee-rate | Query contract fee rate | GET /api-data/futures/fee-rate
+query-funds-detail | Query Funds Detail | GET /api-data/futures/v2/tradeAccountDetail
+coin-m-perpetual-websocket-api | COIN-M Perpetual Websocket API
+heartbeat | Heartbeat
+api-rate-limits | API Rate Limits
+user-authentication | User authentication
+subscribe-orderbook | Subscribe orderBook
+subscribe-orderbook-with-depth | Subscribe orderBook with Depth
+subscribe-full-orderbook | Subscribe full orderBook
+orderbook-message | OrderBook message
+unsubscribe-orderbook | Unsubscribe orderBook
+subscribe-trade | Subscribe trade
+trade-message | Trade message
+unsubscribe-trade | Unsubscribe trade
+subscribe-kline | Subscribe kline
+kline-message | Kline message
+unsubscribe-kline | Unsubscribe kline
+subscribe-account-order-position-aop | Subscribe account-order-position (AOP)
+account-order-position-aop-message | Account-order-position (AOP) message
+unsubscribe-account-order-position-aop | Unsubscribe account-order-position (AOP)
+subscribe-24-hours-ticker | Subscribe 24 hours ticker
+24-hours-ticker-message | 24-Hours ticker message
+subscribe-price-tick | Subscribe price tick
+tick-message | Tick message
+usd-m-perpetual-rest-api | USDⓈ-M Perpetual Rest API
+query-product-information-2 | Query product information | GET /public/products
+query-product-information-plus | Query product information plus | GET /public/products-plus
+place-order-http-put-prefered-2 | Place order (HTTP PUT, prefered) | PUT /g-orders/create
+place-order-http-post-2 | Place order (HTTP POST) | POST /g-orders
+amend-order-by-orderid | Amend order by orderID | PUT /g-orders/replace
+cancel-single-order-by-orderid | Cancel Single Order by orderID | DELETE /g-orders/cancel
+bulk-cancel-orders-2 | Bulk Cancel Orders | DELETE /g-orders
+cancel-all-orders-2 | Cancel All Orders | DELETE /g-orders/all
+query-account-positions | Query Account Positions | GET /g-accounts/accountPositions
+query-account-positions-with-unrealized-pnl | Query Account Positions with unrealized PNL | GET /g-accounts/positions
+query-risk-unit | Query risk unit | GET /g-accounts/risk-unit
+switch-position-mode-synchronously | Switch Position Mode Synchronously | PUT /g-positions/switch-pos-mode-sync
+set-leverage-2 | Set Leverage | PUT /g-positions/leverage
+set-risklimit | Set RiskLimit
+assign-position-balance | Assign Position Balance | POST /g-positions/assign
+query-open-orders-by-symbol-2 | Query open orders by symbol | GET /g-orders/activeList
+query-closed-orders-by-symbol-2 | Query closed orders by symbol | GET /exchange/order/v2/orderList
+query-closed-positions | Query closed positions | GET /api-data/g-futures/closedPosition
+query-user-trade-2 | Query user trade | GET /exchange/order/v2/tradingList
+query-order-book-2 | Query Order Book | GET /md/v2/orderbook
+query-kline-2 | Query kline | GET /exchange/public/md/v2/kline/last
+query-trade | Query Trade
+query-24-ticker | Query 24 ticker
+query-24-ticker-for-all-symbols | Query 24 ticker for all symbols
+query-orders-history | Query Orders History | GET /api-data/g-futures/orders
+query-orders-by-ids | Query Orders By Ids | GET /api-data/g-futures/orders/by-order-id
+query-trades-history | Query Trades History | GET /api-data/g-futures/trades
+query-funding-fee-history-2 | Query funding fee history | GET /api-data/g-futures/funding-fees
+query-real-funding-rates | Query real funding rates
+usd-m-perpetual-websocket-api | USDⓈ-M Perpetual Websocket API
+heartbeat-2 | Heartbeat
+api-rate-limits-2 | API Rate Limits
+api-user-authentication | API User Authentication
+subscribe-orderbook-2 | Subscribe OrderBook
+subscribe-orderbook-with-depth-2 | Subscribe orderBook with Depth
+orderbook-message-2 | OrderBook Message:
+unsubscribe-orderbook-2 | Unsubscribe OrderBook
+subscribe-trade-2 | Subscribe Trade
+trade-message-format | Trade Message Format：
+unsubscribe-trade-2 | Unsubscribe Trade
+subscribe-kline-2 | Subscribe Kline
+kline-message-format | Kline Message Format：
+unsubscribe-kline-2 | Unsubscribe Kline
+subscribe-account-order-position-aop-2 | Subscribe Account-Order-Position (AOP)
+account-order-position-aop-message-sample | Account-Order-Position (AOP) Message Sample:
+unsubscribe-account-order-position-aop-2 | Unsubscribe Account-Order-Position (AOP)
+subscribe-account-margin-ras | Subscribe account margin (RAS)
+account-margin-ras-message-sample | account margin (RAS) Message Sample:
+fields-in-riskunit | Fields in RiskUnit
+fields-of-riskwallet | Fields of RiskWallet
+unsubscribe-account-margin-ras | Unsubscribe account margin (RAS)
+subscribe-24-hours-ticker-2 | Subscribe 24 Hours Ticker
+hours-ticker-message-format | Hours Ticker Message Format：
+subscribe-tick-event-for-symbol-price | Subscribe tick event for symbol price
+push-event | push event
+spot-rest-api | Spot REST API
+endpoint-security-type-2 | Endpoint security type
+query-product-information-3 | Query product information | GET /public/products
+query-product-information-plus-2 | Query product information plus | GET /public/products-plus
+query-server-time-2 | Query server time | GET /public/time
+price-ratio-value-scales-2 | Price/Ratio/Value scales
+common-order-fields-2 | Common order fields
+place-order-http-put-prefered-3 | Place order (HTTP PUT, prefered) | PUT /spot/orders/create
+place-order-http-post-3 | Place order (HTTP POST) | POST /spot/orders
+amend-order | Amend order | PUT /spot/orders
+cancel-order | Cancel order | DELETE /spot/orders
+cancel-all-order-by-symbol | Cancel all order by symbol | DELETE /spot/orders/all
+query-open-order-by-order-id-or-client-order-id | Query open order by order ID or client order ID | GET /spot/orders/active
+query-all-open-orders-by-symbol | Query all open orders by symbol | GET /spot/orders
+query-wallets | Query wallets | GET /spot/wallets
+query-orders-by-order-id-or-client-order-id | Query orders by order ID or client order ID | GET /api-data/spots/orders/by-order-id
+query-order-history | Query order history | GET /api-data/spots/orders
+query-trade-history | Query trade history | GET /api-data/spots/trades
+query-pnl | Query PnL | GET /api-data/spots/pnls
+query-chain-information | Query chain information | GET /exchange/public/cfg/chain-settings
+query-deposit-address-by-currency | Query deposit address by currency | GET /exchange/wallets/v2/depositAddress
+query-recent-deposit-history | Query recent deposit history | GET /exchange/wallets/depositList
+query-recent-withdraw-history | Query recent withdraw history | GET /exchange/wallets/withdrawList
+query-funds-history | Query funds history | GET /api-data/spots/funds
+query-fee-rate-by-quote-currency | Query fee rate by quote currency | GET /api-data/spots/fee-rate
+query-order-book-3 | Query order book | GET /md/orderbook
+query-full-order-book-2 | Query full order book | GET /md/fullbook
+query-recent-trades-2 | Query recent trades | GET /md/trade
+query-24-hours-ticker-for-all-symbols-2 | Query 24 hours ticker for all symbols | GET /md/spot/ticker/24hr/all
+query-24-hours-ticker-2 | Query 24 hours ticker | GET /md/spot/ticker/24hr
+spot-websocket-api | Spot Websocket API
+heartbeat-3 | Heartbeat
+user-authentication-2 | User authentication
+subscribe-orderbook-3 | Subscribe orderBook
+subscribe-full-orderbook-2 | Subscribe full orderBook
+orderbook-message-3 | OrderBook message
+unsubscribe-orderbook-3 | Unsubscribe orderBook
+subscribe-trade-3 | Subscribe trade
+trade-message-2 | Trade message
+unsubscribe-trade-3 | Unsubscribe trade
+subscribe-kline-3 | Subscribe kline
+kline-message-2 | Kline message
+unsubscribe-kline-3 | Unsubscribe kline
+subscribe-wallet-order | Subscribe wallet-order
+wallet-order-message | Wallet-Order message
+unsubscribe-wallet-order | Unsubscribe wallet-order
+subscribe-spot-24-hours-ticker | Subscribe spot 24-hours ticker
+spot-24-hours-ticker-message | Spot 24-hours ticker message
+subscribe-investment-account | Subscribe investment account
+investment-account-message | Investment account message
+margin-trading-api | Margin Trading API
+endpoint-security-type-3 | Endpoint security type
+query-product-information-4 | Query product information | GET /public/products
+price-ratio-value-scales-3 | Price/Ratio/Value scales
+common-order-fields-3 | Common order fields
+place-order-http-put-prefered-4 | Place order (HTTP PUT, prefered) | PUT /margin-trade/orders/create
+cancel-order-2 | Cancel order | DELETE /margin-trade/orders
+cancel-all-order-by-symbol-2 | Cancel all order by symbol | DELETE /margin-trade/orders/all
+query-open-order-by-order-id-or-client-order-id-2 | Query open order by order ID or client order ID | GET /margin-trade/orders/active
+query-all-open-orders-by-symbol-2 | Query all open orders by symbol | GET /margin-trade/orders
+query-margin-orders-details | Query margin orders details | GET /margin/orders
+query-margin-order-trades-details | Query margin order trades details | GET /margin/orders/trades
+query-margin-borrow-interest-history | Query margin borrow interest history | GET /margin/borrow/interests
+query-margin-borrow-history-records | Query margin borrow history records | GET /margin/borrow
+query-margin-payback-history | Query margin payback history | GET /margin/payback
+post-margin-borrow-request | Post margin borrow request | POST /margin/borrow
+post-margin-payback-history | Post margin payback history | POST /margin/payback
+query-wallets-2 | Query wallets | GET /margin-trade/wallets
+margin-trading-websocket-api | Margin Trading Websocket API
+subscribe-margin-account-and-order | Subscribe margin account and order
+transfer-rest-api | Transfer REST API
+transfer-between-spot-and-futures | Transfer between spot and futures | POST /assets/transfer
+query-transfer-history | Query transfer history | GET /assets/transfer
+spot-sub-to-main-transfer-for-sub-account-only | Spot sub to main transfer (for sub-account only) | POST /assets/spots/sub-accounts/transfer
+query-transfer-history-of-spot-accounts-between-main-and-sub | Query transfer history of spot accounts between main and sub | GET /assets/spots/sub-accounts/transfer
+futures-sub-to-main-transfer-for-sub-account-only | Futures sub to main transfer (for sub-account only) | POST /assets/futures/sub-accounts/transfer
+query-transfer-history-of-contract-accounts-between-main-and-sub | Query transfer history of contract accounts between main and sub | GET /assets/futures/sub-accounts/transfer
+universal-transfer-main-account-only-transfer-between-sub-to-main-main-to-sub-or-sub-to-sub | Universal transfer (main account only) - transfer between sub to main, main to sub or sub to sub | POST /assets/universal-transfer
+convert-rest-api | Convert REST API
+rfq-quote | RFQ quote | GET /assets/quote
+convert | Convert | POST /assets/convert
+query-convert-history | Query convert history | GET /assets/convert
+new-transfer-rest-api-universal-transfer-rest-api | New Transfer REST API (Universal Transfer REST API)
+transfer-between-wallets-within-an-account | Transfer between wallets within an account | POST /wallets/account/transfer
+transfer-between-main-and-sub-accounts | Transfer between main and sub-accounts
+query-account-wallet-transfer-history | Query account wallet transfer history
+deposit-and-withdraw-rest-api | Deposit And Withdraw REST API
+endpoint-security-type-4 | Endpoint Security Type
+price-ratio-value | Price/Ratio/Value
+query-deposit-address-information | Query deposit address information | GET /phemex-deposit/wallets/api/depositAddress
+query-deposit-history-records | Query deposit history records | GET /phemex-deposit/wallets/api/depositHist
+deposit-status | Deposit status
+query-deposit-chain-settings | Query deposit chain settings | GET /phemex-deposit/wallets/api/chainCfg
+query-withdraw-history-records | Query withdraw history records | GET /phemex-withdraw/wallets/api/withdrawHist
+withdraw-status | Withdraw status
+create-withdraw-request | Create withdraw request | POST /phemex-withdraw/wallets/api/createWithdraw
+cancel-withdraw-request | Cancel withdraw request | POST /phemex-withdraw/wallets/api/cancelWithdraw
+query-withdraw-chain-settings | Query withdraw chain settings | GET /phemex-withdraw/wallets/api/asset/info
+copy-trade-rest-api | Copy Trade REST API
+endpoint-security-type-5 | Endpoint Security Type
+query-performance-information-of-traders | Query performance information of traders | GET /phemex-lb/public/api/trader/performance-info
+unified-trading-account-rest-api | Unified Trading Account REST API
+query-collateral-info | Query collateral info
+query-risk-mode | Query risk mode | GET /uta-api/risk/risk-mode
+switch-risk-mode | Switch risk mode | POST /uta-account/switch-mode
+query-asset | Query asset | GET /uta-biz/assets
+payback-debts | Payback debts | POST /uta-funds/contract/payback
+query-risk-unit-2 | Query risk unit | GET /uta-api/risk/risk-units
+query-borrow-history | Query borrow history | GET /uta-funds/contract/borrow
+query-payback-history | Query payback history | GET /uta-funds/contract/payback
+query-interest-history | Query interest history | GET /uta-funds/contract/borrow/interests
+query-convert-history-2 | Query convert history | GET /uta-exchanger/assets/convert
+other-api | Other API
