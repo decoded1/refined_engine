@@ -187,29 +187,11 @@ class OrderbookLevel:
 @dataclass(slots=True)
 class OrderbookSnapshot:
     symbol: str = ""
-    timestamp: int = 0
+    asks: list[OrderbookLevel] = field(default_factory=list) # Kept sorted via bisect
+    bids: list[OrderbookLevel] = field(default_factory=list) # Kept sorted via bisect
     ask_map: dict[float, float] = field(default_factory=dict) # price -> size
     bid_map: dict[float, float] = field(default_factory=dict) # price -> size
-    _asks_cache: list[OrderbookLevel] = field(default_factory=list)
-    _bids_cache: list[OrderbookLevel] = field(default_factory=list)
-    _dirty: bool = field(default=True)
-
-    @property
-    def asks(self) -> list[OrderbookLevel]:
-        if self._dirty:
-            self._sync()
-        return self._asks_cache
-
-    @property
-    def bids(self) -> list[OrderbookLevel]:
-        if self._dirty:
-            self._sync()
-        return self._bids_cache
-
-    def _sync(self):
-        self._asks_cache = [OrderbookLevel(p, s) for p, s in sorted(self.ask_map.items())]
-        self._bids_cache = [OrderbookLevel(p, s) for p, s in sorted(self.bid_map.items(), reverse=True)]
-        self._dirty = False
+    timestamp: int = 0
 
 
 @dataclass(slots=True)

@@ -8,8 +8,21 @@ import hmac
 import hashlib
 import queue
 import threading
+import socket
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
+
+# ── DNS Fast-Path (Phase 2 Optimization) ─────────────────────────────────────
+
+def resolve_host(url: str) -> str:
+    """Resolves a URL hostname to its IP address to skip DNS lookups."""
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname: return url
+        return socket.gethostbyname(hostname)
+    except Exception:
+        return url
 
 # ── Load .env from same directory ────────────────────────────────────────────
 

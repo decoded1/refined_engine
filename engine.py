@@ -20,6 +20,9 @@ import os
 import array
 import sys
 import asyncio
+import bisect
+import numpy as np
+from numba import jit
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 
@@ -39,6 +42,16 @@ def _log(msg: str):
 
 def _warn(msg: str):
     logger.log("Engine", f"⚠ {msg}")
+
+
+@jit(nopython=True, fastmath=True)
+def _calculate_pnl_jit(price: float, entry_prices: np.ndarray, pnl_factors: np.ndarray, out_pnls: np.ndarray):
+    """
+    Vectorized PnL calculation using ARM64 Machine Code.
+    Uses M3 Performance Cores via Numba JIT.
+    """
+    for i in range(len(entry_prices)):
+        out_pnls[i] = (price - entry_prices[i]) * pnl_factors[i]
 
 
 class PhemexEngine:
@@ -85,6 +98,12 @@ class PhemexEngine:
         self._wallet = Wallet()
         self._positions: list[Position] = []
         self._pos_map: dict[str, list[Position]] = {} # Optimized lookup
+        
+        # Parallel Primitive Arrays for JIT Math (Phase 3 Optimization)
+        self._pos_entry_prices = np.zeros(0, dtype=np.float64)
+        self._pos_pnl_factors = np.zeros(0, dtype=np.float64)
+        self._pos_unrealized_pnls = np.zeros(0, dtype=np.float64)
+        
         self._orders: list[Order] = []
         self._order_map: dict[str, Order] = {} # Optimized lookup
         self._active_ids: set[str] = set()     # High-speed existence set
@@ -135,6 +154,11 @@ class PhemexEngine:
 
         now = int(time.time())
         self.ws.set_credentials(self._api_key, self._api_secret)
+
+        # Optimization: DNS Fast-Path (Pre-resolve once)
+        from .config import resolve_host
+        _log(f"Pre-resolving hostnames for {self.rest.base}...")
+        resolve_host(self.rest.base) 
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             # 1. Start all REST requests in parallel (History removed)
@@ -460,16 +484,6 @@ class PhemexEngine:
         """Returns the high-speed local L2 mirror (O(1))."""
         return self._orderbook
 
-    @property
-    def asks(self) -> list[OrderbookLevel]:
-        """Returns lazy-sorted list of asks."""
-        return self._orderbook.asks
-
-    @property
-    def bids(self) -> list[OrderbookLevel]:
-        """Returns lazy-sorted list of bids."""
-        return self._orderbook.bids
-
     def get_volume_at(self, price: float, side: str = "Buy") -> float:
         """Returns the volume at a specific price level (O(1))."""
         book = self._orderbook
@@ -597,17 +611,25 @@ class PhemexEngine:
 
     def _on_price(self, price: float, symbol: str = ""):
         """
-        Optimized PnL update (Ground Level).
-        Uses local binding and pnl_factor to reduce bytecode overhead.
+        Optimized PnL update (JIT-Accelerated).
+        Uses Numba Machine Code for all-symbol updates and local binding for target.
         """
         self._price = price
         target = symbol or self._symbol
         
-        # Local lookup binding
-        pos_list = self._pos_map.get(target, [])
-        for p in pos_list:
-            # Single multiplication logic
-            p.unrealized_pnl = (price - p.entry_price) * p.pnl_factor
+        # 1. JIT Vectorized Update for ALL positions (High-speed broad coverage)
+        if len(self._pos_entry_prices) > 0:
+            _calculate_pnl_jit(price, self._pos_entry_prices, self._pos_pnl_factors, self._pos_unrealized_pnls)
+            
+            # Sync values back to objects for public API
+            for i, p in enumerate(self._positions):
+                p.unrealized_pnl = self._pos_unrealized_pnls[i]
+
+        # 2. Specific Target update (for cases where symbol differs from engine)
+        if target != self._symbol:
+            pos_list = self._pos_map.get(target, [])
+            for p in pos_list:
+                p.unrealized_pnl = (price - p.entry_price) * p.pnl_factor
 
     def _on_candles(self, candles: list[Candle]):
         """Offloads heavy bulk update to the background executor (Non-blocking)."""
@@ -617,7 +639,11 @@ class PhemexEngine:
 
     def _handle_candle_burst(self, candles: list[Candle]):
         """Internal background task for candle map maintenance."""
-        self._candle_map.update({c.time: c for c in candles})
+        # Optimization: Use direct loop instead of update() to avoid temporary dict allocation
+        cmap = self._candle_map
+        for c in candles:
+            cmap[c.time] = c
+        
         self._candles_dirty = True
 
         # Phase 1 Ground Level: If price is unknown, use the latest candle close
@@ -643,6 +669,12 @@ class PhemexEngine:
             p.pnl_factor = p.size * p.side_multiplier
         
         self._positions = positions
+        
+        # Sync Numpy Arrays for JIT
+        self._pos_entry_prices = np.array([p.entry_price for p in positions], dtype=np.float64)
+        self._pos_pnl_factors = np.array([p.pnl_factor for p in positions], dtype=np.float64)
+        self._pos_unrealized_pnls = np.zeros(len(positions), dtype=np.float64)
+
         # Update position map
         self._pos_map = {}
         for p in self._positions:
@@ -652,36 +684,56 @@ class PhemexEngine:
 
     def _on_orderbook(self, data: dict):
         """
-        Maintains the local L2 mirror with O(1) price maps.
-        Phemex sends 'snapshot' or 'incremental' updates.
+        Maintains the local L2 mirror with O(1) price maps and O(log N) sorted lists.
+        Uses binary search (bisect) for in-place sorted maintenance.
         """
         is_snapshot = data.get("type") == "snapshot"
-        book = data.get("orderbook_p", {})
+        book_data = data.get("orderbook_p", {})
         
         # 1. Parse Levels
-        new_asks = {float(a[0]): float(a[1]) for a in book.get("asks", [])}
-        new_bids = {float(b[0]): float(b[1]) for b in book.get("bids", [])}
+        new_asks = {float(a[0]): float(a[1]) for a in book_data.get("asks", [])}
+        new_bids = {float(b[0]): float(b[1]) for b in book_data.get("bids", [])}
+
+        book = self._orderbook
 
         if is_snapshot:
             # Full replacement
-            self._orderbook.ask_map = {p: s for p, s in new_asks.items() if s > 0}
-            self._orderbook.bid_map = {p: s for p, s in new_bids.items() if s > 0}
+            book.ask_map = {p: s for p, s in new_asks.items() if s > 0}
+            book.bid_map = {p: s for p, s in new_bids.items() if s > 0}
+            book.asks = [OrderbookLevel(p, s) for p, s in sorted(book.ask_map.items())]
+            book.bids = [OrderbookLevel(p, s) for p, s in sorted(book.bid_map.items(), reverse=True)]
         else:
-            # Incremental update: O(1) merge into maps
-            ask_map = self._orderbook.ask_map
-            bid_map = self._orderbook.bid_map
-
-            # Apply updates
+            # Incremental update: O(log N) updates using bisect
+            # Update Asks (Ascending)
             for p, s in new_asks.items():
-                if s == 0: ask_map.pop(p, None)
-                else: ask_map[p] = s
-            
-            for p, s in new_bids.items():
-                if s == 0: bid_map.pop(p, None)
-                else: bid_map[p] = s
+                idx = bisect.bisect_left(book.asks, p, key=lambda x: x.price)
+                if idx < len(book.asks) and book.asks[idx].price == p:
+                    if s == 0:
+                        book.asks.pop(idx)
+                        book.ask_map.pop(p, None)
+                    else:
+                        book.asks[idx].size = s
+                        book.ask_map[p] = s
+                elif s > 0:
+                    book.asks.insert(idx, OrderbookLevel(p, s))
+                    book.ask_map[p] = s
 
-        self._orderbook._dirty = True
-        self._orderbook.timestamp = data.get("timestamp", 0)
+            # Update Bids (Descending)
+            for p, s in new_bids.items():
+                # Descending search: negate values
+                idx = bisect.bisect_left(book.bids, -p, key=lambda x: -x.price)
+                if idx < len(book.bids) and book.bids[idx].price == p:
+                    if s == 0:
+                        book.bids.pop(idx)
+                        book.bid_map.pop(p, None)
+                    else:
+                        book.bids[idx].size = s
+                        book.bid_map[p] = s
+                elif s > 0:
+                    book.bids.insert(idx, OrderbookLevel(p, s))
+                    book.bid_map[p] = s
+
+        book.timestamp = data.get("timestamp", 0)
 
     def _pipeline_requests(self, func, requests: list) -> list:
         """Helper to execute multiple API calls concurrently."""

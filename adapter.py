@@ -615,15 +615,16 @@ class PhemexAdapter:
         # Phemex G-API uses query string for all methods
         # Optimization: High-speed Fast-Path Serializer
         query_string = self._fast_urlencode(params)
-        path = "".join([endpoint, "?", query_string]) if query_string else endpoint
-        full_url = "".join([base, path])
+        path = f"{endpoint}?{query_string}" if query_string else endpoint
+        full_url = f"{base}{path}"
 
         # Signature: HMAC(endpoint + queryString + expiry)
         query_string_sig = query_string.replace("%2C", ",")
         
         # Optimization: Use pre-encoded path and context copying
+        # Phase 1.7: Combine as bytes without intermediate string formatting
         end_bytes = path_cache.get(endpoint) or endpoint.encode("utf-8")
-        msg_bytes = b"".join([end_bytes, query_string_sig.encode("utf-8"), expiry_bytes])
+        msg_bytes = end_bytes + query_string_sig.encode("utf-8") + expiry_bytes
         
         # Fast HMAC Copy-then-Update
         h = self._hmac_context.copy()
@@ -632,7 +633,7 @@ class PhemexAdapter:
 
         # Optimization: Use isolated copy of header dictionary
         headers = self._header_template.copy()
-        headers["x-phemex-request-expiry"] = expiry_bytes.decode("utf-8")
+        headers["x-phemex-request-expiry"] = str(expiry)
         headers["x-phemex-request-signature"] = signature
 
         # Rate Limit Safety
@@ -642,11 +643,12 @@ class PhemexAdapter:
         resp = self.session.request(method, full_url, headers=headers, timeout=10)
         json_data = json.loads(resp.content)
 
-        # Rate limit tracking
-        remaining = resp.headers.get("x-ratelimit-remaining-contract")
+        # Rate limit tracking (Safe access)
+        resp_headers = getattr(resp, "headers", {})
+        remaining = resp_headers.get("x-ratelimit-remaining-contract")
         if remaining:
             rem = int(remaining)
-            limit = int(resp.headers.get("x-ratelimit-limit-contract", 500))
+            limit = int(resp_headers.get("x-ratelimit-limit-contract", 500))
             if rem < 50:
                 _warn(f"Low Rate Limit: {remaining}")
 

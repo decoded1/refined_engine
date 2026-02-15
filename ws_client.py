@@ -66,19 +66,19 @@ class WSClient:
         self.on_trade: Optional[Callable[[list[dict]], None]] = None
         self.on_orderbook: Optional[Callable[[dict], None]] = None
 
-        # Dispatch Table for O(1) message routing (Static Tuples for speed)
-        self._dispatch_keys = (
-            ("kline_p", self._handle_kline),
-            ("kline", self._handle_kline),
-            ("tick_p", self._handle_tick),
-            ("trades_p", self._handle_trades),
-            ("orderbook_p", self._handle_orderbook),
-            ("accounts_p", self._handle_aop),
-            ("positions_p", self._handle_aop),
-        )
-        self._dispatch_methods = (
-            ("perp_market24h_pack_p.update", self._handle_ticker),
-        )
+        # Dispatch Table for O(1) message routing
+        self._dispatch_keys = {
+            "kline_p": self._handle_kline,
+            "kline": self._handle_kline,
+            "tick_p": self._handle_tick,
+            "trades_p": self._handle_trades,
+            "orderbook_p": self._handle_orderbook,
+            "accounts_p": self._handle_aop,
+            "positions_p": self._handle_aop,
+        }
+        self._dispatch_methods = {
+            "perp_market24h_pack_p.update": self._handle_ticker,
+        }
 
     @property
     def connected(self) -> bool:
@@ -200,28 +200,25 @@ class WSClient:
                 self._queue.task_done()
                 continue
 
-            # 1. Dispatch by Method
+            # 1. Dispatch by Method (Explicit events)
             method = msg.get("method")
-            if method:
-                for target_method, handler in self._dispatch_methods:
-                    if method == target_method:
-                        try:
-                            handler(msg)
-                        except Exception as e:
-                            _warn(f"Handler error (method={method}): {e}")
-                        self._queue.task_done()
-                        break
-                else: # Only if not found in methods
-                    pass
-            
-            if self._queue.unfinished_tasks == 0: continue # Method handled it
+            method_dispatch = self._dispatch_methods
+            if method in method_dispatch:
+                try:
+                    method_dispatch[method](msg)
+                except Exception as e:
+                    _warn(f"Handler error (method={method}): {e}")
+                self._queue.task_done()
+                continue
 
-            # 2. Dispatch by Data Key
+            # 2. Dispatch by Data Key (Market/Account data)
+            # Optimization: Iterate over message keys (usually 2-3) instead of dispatch list (7+)
             handled = False
-            for key, handler in self._dispatch_keys:
-                if key in msg:
-                    # print(f"[WS DEBUG] Processing Key: {key}")
+            dispatch = self._dispatch_keys
+            for key in msg:
+                if key in dispatch:
                     try:
+                        handler = dispatch[key]
                         handler(msg if key in ("trades_p", "orderbook_p", "accounts_p", "positions_p") else msg[key])
                     except Exception as e:
                         _warn(f"Handler error (key={key}): {e}")
